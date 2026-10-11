@@ -95,6 +95,12 @@ export async function DELETE(request: Request, { params }: RouteContext): Promis
     }
 
     await db.$transaction(async (tx) => {
+      // B9 retention (user decision 2026-10-11): disconnect deletes this
+      // mailbox's synced messages + sync state. Explicit (not just the FK
+      // cascade) so the wipe is observable under the test fake and its order
+      // is clear. Original Gmail messages on Google are NEVER touched (§1.9).
+      await tx.gmailMessage.deleteMany({ where: { googleConnectionId: account.id } });
+      await tx.gmailSyncState.deleteMany({ where: { googleConnectionId: account.id } });
       await tx.googleConnection.deleteMany({ where: { id: account.id, userId: session.user.id } });
       await recordAudit(tx, {
         userId: session.user.id,

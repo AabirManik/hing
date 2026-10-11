@@ -20,9 +20,7 @@ import {
   ApiError,
   fetchMe,
   isSessionErrorCode,
-  login,
   logoutRequest,
-  registerAccount,
 } from "./apiClient";
 
 export type AuthStatus = "checking" | "signedOut" | "signedIn";
@@ -97,12 +95,6 @@ export function probeAuth(): Promise<void> {
 /** After a successful login/register call (the panel awaits these). */
 export function adoptPlayer(player: MePlayer): void {
   set({ status: "signedIn", player, notice: null });
-}
-
-export async function signIn(kind: "login" | "register", email: string, password: string): Promise<MePlayer> {
-  const player = kind === "login" ? await login(email, password) : await registerAccount(email, password);
-  adoptPlayer(player);
-  return player;
 }
 
 /** Sign out: server revocation first (204), then local state; 401 tolerated. */

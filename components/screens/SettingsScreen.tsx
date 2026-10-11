@@ -247,41 +247,54 @@ export default function SettingsScreen() {
 
         {googleStatus !== null && (
           <div className="mt-3 flex flex-col gap-2 text-sm">
-            {googleStatus.accounts.map((account) => (
-              <div
-                key={account.id}
-                className="flex items-center justify-between gap-3 rounded border border-[var(--mailxp-walnut)]/40 bg-white/50 px-2 py-1.5"
-              >
-                <span className="break-all">
-                  {account.email}{" "}
-                  <span className="text-xs opacity-60">
-                    ({account.status === "released" ? "released" : "connected"})
+            {/* B8b: exactly ONE current Gmail per MailXP account (phase_b8b.md
+                §6). Any additional rows are released history — never offered
+                as "another account to connect". */}
+            {googleStatus.accounts
+              .filter((account) => account.status === "connected")
+              .map((account) => (
+                <div
+                  key={account.id}
+                  className="flex items-center justify-between gap-3 rounded border border-[var(--mailxp-walnut)]/40 bg-white/50 px-2 py-1.5"
+                >
+                  <span className="break-all">
+                    {account.email} <span className="text-xs opacity-60">(connected)</span>
                   </span>
-                </span>
+                  <button
+                    type="button"
+                    disabled={googleBusy}
+                    onClick={() => void disconnectGoogle(account.id)}
+                    className="shrink-0 rounded border-2 border-red-700 px-2 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-50"
+                  >
+                    Disconnect
+                  </button>
+                </div>
+              ))}
+
+            {/* B8b: "Switch Gmail" — one mailbox at a time. Disconnect the
+                current one FIRST, then connect the new one. No silent replace,
+                no "connect a second mailbox". */}
+            {googleStatus.configured &&
+              googleStatus.emailVerified &&
+              googleStatus.accounts.some((account) => account.status === "connected") && (
+                <p className="text-xs opacity-70">
+                  Each MailXP account keeps one Gmail. To switch, disconnect the current address above
+                  first — then connect the new one. Disconnecting removes MailXP&apos;s saved connection
+                  (and asks Google to revoke access); it never deletes your Gmail or its messages.
+                </p>
+              )}
+
+            {googleStatus.configured && googleStatus.emailVerified ? (
+              !googleStatus.accounts.some((account) => account.status === "connected") ? (
                 <button
                   type="button"
                   disabled={googleBusy}
-                  onClick={() => void disconnectGoogle(account.id)}
-                  className="shrink-0 rounded border-2 border-red-700 px-2 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-50"
+                  onClick={() => void connectGoogle()}
+                  className="mt-1 self-start rounded border-2 border-[var(--mailxp-teal)] px-3 py-1.5 text-sm font-semibold transition hover:bg-white/60 disabled:opacity-50"
                 >
-                  Disconnect
+                  {googleBusy ? "Opening Google…" : "Connect Google"}
                 </button>
-              </div>
-            ))}
-
-            {googleStatus.configured && googleStatus.emailVerified ? (
-              <button
-                type="button"
-                disabled={googleBusy}
-                onClick={() => void connectGoogle()}
-                className="mt-1 self-start rounded border-2 border-[var(--mailxp-teal)] px-3 py-1.5 text-sm font-semibold transition hover:bg-white/60 disabled:opacity-50"
-              >
-                {googleBusy
-                  ? "Opening Google…"
-                  : googleStatus.accounts.length > 0
-                    ? "Connect another Google account"
-                    : "Connect Google"}
-              </button>
+              ) : null
             ) : (
               <div className="flex flex-col items-start gap-2">
                 <p className="text-xs opacity-70">

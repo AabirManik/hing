@@ -136,6 +136,22 @@ export const OUTBOX_PLANNERS: Readonly<Record<string, OutboxPlanner>> = {
       dedupeKey: `account.deletion:${userId}`,
     };
   },
+  // B9 Gmail sync: a durable "sync requested" event (written in the same
+  // transaction that establishes/refreshes a connection) becomes a gmail.sync
+  // job. The dedupeKey collapses repeated requests to ONE live job per mailbox
+  // (phase_b9.md §6 "coalesce duplicate pending/running sync jobs per
+  // connection"). A dead job is requeued in place, never duplicated.
+  "gmail.sync_requested": (payload): OutboxDispatch => {
+    const googleConnectionId = (payload as { googleConnectionId?: unknown } | null | undefined)?.googleConnectionId;
+    if (typeof googleConnectionId !== "string" || googleConnectionId.length === 0) {
+      throw new PermanentJobError("validation", "outbox: gmail sync event requires googleConnectionId");
+    }
+    return {
+      jobType: "gmail.sync",
+      payload: { googleConnectionId },
+      dedupeKey: `gmail.sync:${googleConnectionId}`,
+    };
+  },
 };
 
 // ---------------------------------------------------------------------------

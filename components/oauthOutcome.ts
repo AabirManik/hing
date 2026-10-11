@@ -31,7 +31,8 @@ export const OAUTH_OUTCOME_MESSAGES: Record<string, string> = {
   nocode: "Google did not return an authorization code — please try again.",
   provider: "Google could not complete the sign-in — please try again.",
   unverified: "Google did not confirm a verified email for that account — sign-in refused.",
-  conflict: "That Google account is already connected to another player.",
+  conflict:
+    "That Google account is already linked elsewhere, or this MailXP account already has a different Gmail connected. Each account keeps one Gmail — use the already-linked Google identity, or disconnect the current one first to switch.",
   config: "Google sign-in is not configured on this server.",
   account: "This account is scheduled for deletion — sign-in is disabled.",
 };

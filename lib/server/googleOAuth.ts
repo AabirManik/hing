@@ -415,19 +415,46 @@ export async function linkGoogleIdentity(
   const existing = await client.googleConnection.findUnique({ where: { googleSub: input.identity.sub } });
   const tokenData = sealedTokenData(input.refreshToken, input.encryptionKey);
 
-  if (!existing) {
-    const account = await client.googleConnection.create({
-      data: {
-        userId: input.userId,
-        googleSub: input.identity.sub,
-        email: input.identity.email,
-        scopes: input.grantedScopes,
-        ...tokenData,
-        connectedAt: new Date(now),
-        updatedAt: new Date(now),
-      },
+  // B8b (phase_b8b.md §3): one connected mailbox per MailXP user. If THIS
+  // user already holds a DIFFERENT connected googleSub, refuse to add a
+  // second one — the player must explicitly release/disconnect first
+  // ("Switch Gmail"). Runs before any create so we never race the DB index
+  // on the happy path. (Released historical rows do NOT block: they carry no
+  // credentials and are the sanctioned transfer precondition.)
+  if (existing === null || existing.userId !== input.userId) {
+    const current = await client.googleConnection.findFirst({
+      where: { userId: input.userId, status: "connected" },
+      select: { id: true, googleSub: true },
     });
-    return { ok: true, account, outcome: "linked" };
+    if (current !== null && current.googleSub !== input.identity.sub) {
+      return { ok: false, reason: "conflict" };
+    }
+  }
+
+  if (!existing) {
+    try {
+      const account = await client.googleConnection.create({
+        data: {
+          userId: input.userId,
+          googleSub: input.identity.sub,
+          email: input.identity.email,
+          scopes: input.grantedScopes,
+          ...tokenData,
+          connectedAt: new Date(now),
+          updatedAt: new Date(now),
+        },
+      });
+      return { ok: true, account, outcome: "linked" };
+    } catch (error) {
+      // B8b race guard: two concurrent callbacks both passed the pre-check
+      // above and tried to create the user's first/second connected row —
+      // the partial unique index (or unique googleSub) rejected the loser.
+      // Map to a safe conflict; never surface SQL/Prisma details (§5).
+      if ((error as { code?: string }).code === "P2002") {
+        return { ok: false, reason: "conflict" };
+      }
+      throw error;
+    }
   }
 
   if (existing.userId === input.userId) {

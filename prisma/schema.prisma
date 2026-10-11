@@ -331,7 +331,21 @@ model GoogleConnection {
   connectedAt DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  // B9: the synced mailbox for this connection. Cascade so disconnect (row
+  // delete) and account deletion remove messages + sync state automatically;
+  // release deletes them explicitly in the release route (in-place update).
+  messages      GmailMessage[]
+  syncState     GmailSyncState?
+
   @@index([userId])
+  // B8b DRIFT NOTE (reviewed raw SQL, not expressible in the datamodel):
+  // migration 20261010201518_b8b_one_gmail_per_user additionally creates the
+  // partial unique index "GoogleConnection_userId_connected_key" on (userId)
+  // WHERE status = 'connected' — at most ONE connected mailbox per user.
+  // `prisma migrate diff` will always report this index as missing from the
+  // datamodel; that is expected drift, not a bug. The invariant is enforced
+  // in PostgreSQL and covered by tests. googleSub stays @@unique above
+  // (one Google identity -> one user, ever).
 }
 
 model OAuthState {
@@ -347,4 +361,73 @@ model OAuthState {
 
   @@index([userId])
   @@index([expiresAt])
+}
+
+// ---- Phase B9: real Gmail sync (messages + cursor state) -------------------
+// phase_b9.md §8. Purely additive: two new tables, no changes to any B0–B8b
+// table. GoogleConnection is untouched except a new back-relation; the B8b
+// partial unique index (one connected mailbox per user) is preserved as raw
+// SQL and is NOT affected by this migration.
+//
+// Retention (user decision 2026-10-11, B9 question round): disconnect deletes
+// the GoogleConnection ROW → ON DELETE Cascade removes that mailbox's messages
+// + sync state. Release keeps the connection row (status=released) but WIPES
+// the refresh-token columns in place AND deletes its messages + sync state
+// (explicitly in the release route — Cascade can't fire on an in-place row
+// update). Account deletion cascades User → GoogleConnection → messages/sync.
+// Only non-personal sync state (cursor/status/error class) survives as needed;
+// message bodies/senders/subjects never outlive the connection.
+//
+// GmailMessage stores MINIMAL personal content: sender, subject, snippet, the
+// plain-text body (text/plain only — HTML is never rendered or stored, spec
+// §5), unread flag, label ids, and attachment METADATA (never bytes, spec §5).
+// Raw provider payloads, access/refresh tokens, and HTML are never persisted.
+
+model GmailMessage {
+  id                 String          @id @default(uuid(7))
+  googleConnectionId String
+  googleConnection   GoogleConnection @relation(fields: [googleConnectionId], references: [id], onDelete: Cascade)
+  gmailMessageId     String // Gmail's stable message id
+  gmailThreadId      String? // for threading in the inbox
+  internalDate       DateTime // provider receive time (UTC)
+  sender             String // From header (display-safe)
+  subject            String? // Subject header
+  snippet            String? // provider snippet (plain text)
+  bodyText           String? // text/plain ONLY (never HTML; spec §5)
+  isUnread           Boolean         @default(true)
+  labels             Json @default("[]") // label ids (array of strings), as permitted
+  attachments        Json @default("[]") // metadata only: [{filename,mimeType,size}] — never bytes
+  syncedAt           DateTime        @default(now())
+
+  // External identity is (owning connection, Gmail message id) — idempotent
+  // upsert target (spec §5) so re-sync / duplicate pushes never duplicate rows.
+  @@unique([googleConnectionId, gmailMessageId])
+  // Inbox reads: newest-first per mailbox, unread filter, thread lookup.
+  @@index([googleConnectionId, internalDate(sort: Desc)])
+  @@index([googleConnectionId, isUnread])
+  @@index([gmailThreadId])
+}
+
+enum GmailSyncStatus {
+  pending // queued, not yet run
+  running // a job holds the lease and is fetching
+  synced // last sync committed successfully
+  delayed // backed off / reconciliation scheduled, not an error
+  reconnect_required // refresh token revoked/invalid/missing scope — needs a human
+  error // transient provider/db failure after retries
+}
+
+model GmailSyncState {
+  id                 String          @id @default(uuid(7))
+  googleConnectionId String          @unique // exactly one sync state per mailbox
+  googleConnection   GoogleConnection @relation(fields: [googleConnectionId], references: [id], onDelete: Cascade)
+  status             GmailSyncStatus  @default(pending)
+  historyId          String? // Gmail history cursor — advanced ONLY after a durable commit (spec §6)
+  historyWindowDays  Int             @default(30) // user-approved window (7/30/90/all); default 30
+  lastSyncedAt       DateTime? // last time a sync job ran (any outcome)
+  lastSuccessAt      DateTime? // last COMMITSYNC — cursor advanced
+  nextReconcileAt    DateTime? // scheduled reconciliation (missed-push recovery, spec §6)
+  lastErrorClass     String? // safe category (e.g. "provider", "timeout"), never raw payloads
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
 }

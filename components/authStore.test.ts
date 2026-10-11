@@ -31,36 +31,30 @@ vi.mock("./apiClient", () => ({
     }
   },
   fetchMe: vi.fn(),
-  login: vi.fn(),
-  registerAccount: vi.fn(),
   logoutRequest: vi.fn(),
   isSessionErrorCode: (code: string) => code === "UNAUTHENTICATED" || code === "SESSION_EXPIRED",
 }));
 
 import type { ApiError } from "./apiClient";
-import { fetchMe, login, logoutRequest, registerAccount } from "./apiClient";
+import { fetchMe, logoutRequest } from "./apiClient";
 import {
+  adoptPlayer,
   clearNotice,
   getAuthSnapshot,
   probeAuth,
   reportSessionLost,
   resetAuthStore,
-  signIn,
   signOut,
 } from "./authStore";
 
 const PLAYER = { id: "user-1", email: "a@example.test", emailVerified: false, createdAt: "2026-01-01T00:00:00.000Z" };
 
 const fetchMeMock = vi.mocked(fetchMe);
-const loginMock = vi.mocked(login);
-const registerMock = vi.mocked(registerAccount);
 const logoutMock = vi.mocked(logoutRequest);
 
 beforeEach(() => {
   resetAuthStore();
   fetchMeMock.mockReset();
-  loginMock.mockReset();
-  registerMock.mockReset();
   logoutMock.mockReset();
   logoutMock.mockResolvedValue(undefined);
 });
@@ -104,48 +98,26 @@ describe("probeAuth (boot)", () => {
   });
 });
 
-describe("signIn / signOut", () => {
-  it("login success adopts the player and clears notices", async () => {
+describe("adoptPlayer / signOut", () => {
+  it("adoptPlayer marks signed in and clears notices", async () => {
     fetchMeMock.mockResolvedValue(null);
     await probeAuth();
     reportSessionLost("SESSION_EXPIRED");
     expect(getAuthSnapshot().notice).toBeTruthy();
 
-    loginMock.mockResolvedValue(PLAYER);
-    const returned = await signIn("login", PLAYER.email, "pw");
-    expect(returned).toEqual(PLAYER);
-    expect(loginMock).toHaveBeenCalledWith(PLAYER.email, "pw");
+    adoptPlayer(PLAYER);
     expect(getAuthSnapshot()).toEqual({ status: "signedIn", player: PLAYER, notice: null });
   });
 
-  it("register success routes through registerAccount", async () => {
-    registerMock.mockResolvedValue(PLAYER);
-    await signIn("register", PLAYER.email, "longenoughpw1");
-    expect(registerMock).toHaveBeenCalledWith(PLAYER.email, "longenoughpw1");
-    expect(loginMock).not.toHaveBeenCalled();
-    expect(getAuthSnapshot().status).toBe("signedIn");
-  });
-
-  it("failed sign-in leaves the previous state untouched (error propagates)", async () => {
-    fetchMeMock.mockResolvedValue(null);
-    await probeAuth();
-    loginMock.mockRejectedValue(new Error("INVALID_CREDENTIALS"));
-    await expect(signIn("login", PLAYER.email, "bad")).rejects.toThrow();
-    expect(getAuthSnapshot().status).toBe("signedOut");
-    expect(getAuthSnapshot().player).toBeNull();
-  });
-
   it("sign-out revokes server-side first, then clears local state", async () => {
-    loginMock.mockResolvedValue(PLAYER);
-    await signIn("login", PLAYER.email, "pw");
+    adoptPlayer(PLAYER);
     await signOut();
     expect(logoutMock).toHaveBeenCalledTimes(1);
     expect(getAuthSnapshot()).toEqual({ status: "signedOut", player: null, notice: null });
   });
 
   it("sign-out still clears locally if the logout call rejects (finally rule)", async () => {
-    loginMock.mockResolvedValue(PLAYER);
-    await signIn("login", PLAYER.email, "pw");
+    adoptPlayer(PLAYER);
     logoutMock.mockRejectedValue(new Error("network"));
     await expect(signOut()).rejects.toThrow("network");
     expect(getAuthSnapshot().status).toBe("signedOut"); // no stuck signed-in UI
@@ -155,24 +127,21 @@ describe("signIn / signOut", () => {
 
 describe("reportSessionLost (single transition, no loops)", () => {
   it("SESSION_EXPIRED → signedOut with expiry notice", async () => {
-    loginMock.mockResolvedValue(PLAYER);
-    await signIn("login", PLAYER.email, "pw");
+    adoptPlayer(PLAYER);
     reportSessionLost("SESSION_EXPIRED");
     expect(getAuthSnapshot().status).toBe("signedOut");
     expect(getAuthSnapshot().notice).toContain("expired");
   });
 
   it("UNAUTHENTICATED → signedOut with sign-in notice", async () => {
-    loginMock.mockResolvedValue(PLAYER);
-    await signIn("login", PLAYER.email, "pw");
+    adoptPlayer(PLAYER);
     reportSessionLost("UNAUTHENTICATED");
     expect(getAuthSnapshot().status).toBe("signedOut");
     expect(getAuthSnapshot().notice).toContain("sign in");
   });
 
   it("ignores non-session codes (a VALIDATION_ERROR must not kill the session)", async () => {
-    loginMock.mockResolvedValue(PLAYER);
-    await signIn("login", PLAYER.email, "pw");
+    adoptPlayer(PLAYER);
     reportSessionLost("VALIDATION_ERROR");
     reportSessionLost("RATE_LIMITED");
     expect(getAuthSnapshot().status).toBe("signedIn");
@@ -201,19 +170,12 @@ describe("describeAuthError presentation (AuthPanel pure mapping)", () => {
   it("maps stable codes to non-enumerating messages", async () => {
     const { describeAuthError } = await import("./AuthPanel");
     const { ApiError: ApiErrorClass } = await import("./apiClient");
-    const make = (code: string, status = 400, details?: Array<{ field: string; message: string }>): ApiError =>
-      new ApiErrorClass(status, code, "raw server text", "req", details ?? []) as never;
+    const make = (code: string, status = 400): ApiError =>
+      new ApiErrorClass(status, code, "raw server text", "req", []) as never;
 
-    expect(describeAuthError(make("INVALID_CREDENTIALS", 401)).message).toBe("Invalid email or password.");
-    expect(describeAuthError(make("EMAIL_EXISTS", 409)).message).toContain("already registered");
+    expect(describeAuthError(make("GOOGLE_SIGNIN_REQUIRED", 403)).message).toContain("Continue with Google");
     expect(describeAuthError(make("RATE_LIMITED", 429)).message).toContain("Too many attempts");
     expect(describeAuthError(make("NETWORK_ERROR", 0)).message).toContain("reach the server");
-
-    const validation = describeAuthError(
-      make("VALIDATION_ERROR", 400, [{ field: "password", message: "Must be at least 10 characters." }]),
-    );
-    expect(validation.message).toContain("check the form");
-    expect(validation.fields[0]).toContain("Must be at least 10 characters");
 
     // Unknown codes fall back to the safe server summary — never a throw.
     expect(describeAuthError(make("INTERNAL_ERROR", 500)).message).toBe("raw server text");

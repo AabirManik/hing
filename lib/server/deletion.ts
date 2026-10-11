@@ -61,9 +61,18 @@ export interface DeletionTxDb {
   idempotencyRecord: { deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }> };
   // B8 (phase_b8.md §7): erasure must leave no Google credentials or OAuth
   // state behind — deleted explicitly alongside the other dependents.
-  googleConnection: { deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }> };
+  googleConnection: {
+    deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
+    findMany(args: { where: Record<string, unknown>; select: { id: boolean } }): Promise<Array<{ id: string }>>;
+  };
   // Prisma exposes model OAuthState as `oAuthState` (first letter lowered).
   oAuthState: { deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }> };
+  // B9: account deletion must erase synced email content + sync state
+  // (phase_b9.md §5/§8). Deleted explicitly by connection below; the FK
+  // cascade would also remove them on real PostgreSQL, but the explicit
+  // deleteMany keeps the test double honest and the order observable.
+  gmailMessage: { deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }> };
+  gmailSyncState: { deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }> };
   playerProfile: {
     findUnique(args: {
       where: { userId: string };
@@ -138,6 +147,18 @@ export async function eraseAccount(db: DeletionDb, input: { userId: string; requ
     // (phase_b8.md §7). Cascade FKs would also remove them on real PostgreSQL;
     // explicit deletes keep the test double honest and the order observable.
     await tx.oAuthState.deleteMany({ where: { userId: input.userId } });
+    // B9: erase synced email content + sync state for every mailbox this user
+    // ever connected (including released rows whose connection the FK cascade
+    // below would also remove). Delete the mail rows FIRST by connection id so
+    // nothing personal survives the wipe (phase_b9.md §5/§8).
+    const connections = await tx.googleConnection.findMany({
+      where: { userId: input.userId },
+      select: { id: true },
+    });
+    for (const connection of connections) {
+      await tx.gmailMessage.deleteMany({ where: { googleConnectionId: connection.id } });
+      await tx.gmailSyncState.deleteMany({ where: { googleConnectionId: connection.id } });
+    }
     await tx.googleConnection.deleteMany({ where: { userId: input.userId } });
 
     // 4. The user row last.

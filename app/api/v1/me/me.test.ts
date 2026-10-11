@@ -9,13 +9,12 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeDb, type FakeDb } from "@/lib/server/fakeDb";
+import { hashPassword } from "@/lib/server/password";
 import { hashSessionToken } from "@/lib/server/session";
 
 vi.mock("@/lib/server/prisma", () => ({ getDb: vi.fn() }));
 
 import { getDb } from "@/lib/server/prisma";
-import { POST as loginPOST } from "../auth/login/route";
-import { POST as registerPOST } from "../auth/register/route";
 import { DELETE as meDELETE, GET as meGET } from "./route";
 
 const ORIGIN = "http://localhost:3000";
@@ -45,16 +44,22 @@ function cookieFor(response: Response): string {
 }
 
 async function registerUser(email = "me-user@example.com") {
-  const response = await registerPOST(
-    new Request(`${BASE}/auth/register`, {
-      method: "POST",
-      body: JSON.stringify({ email, password: VALID_PW }),
-      headers: { origin: ORIGIN, "content-type": "application/json", "x-forwarded-for": nextIp() },
-    }),
-  );
-  expect(response.status).toBe(201);
-  const body = (await response.json()) as { player: { id: string } };
-  return { cookie: cookieFor(response), playerId: body.player.id };
+  // Seed directly: the password register route is retired (Google-only), so
+  // tests create the user + profile + session here. The DELETE route re-auths
+  // against the stored hash, so we set a real bcrypt hash of VALID_PW.
+  const passwordHash = await hashPassword(VALID_PW);
+  const user = (await fake.client.user.create({ data: { email, passwordHash } })) as { id: string };
+  await fake.client.playerProfile.create({ data: { userId: user.id, prefs: {} } });
+  const raw = `me-seed-${email}-${Math.random().toString(36).slice(2)}`;
+  await fake.client.session.create({
+    data: {
+      userId: user.id,
+      tokenHash: hashSessionToken(raw),
+      lastSeenAt: new Date(),
+      expiresAt: new Date(Date.now() + 1e9),
+    },
+  });
+  return { cookie: `mailxp.session=${raw}`, playerId: user.id };
 }
 
 function meRequest(method: "GET" | "DELETE", opts: { cookie?: string; body?: unknown; origin?: string | null } = {}): Request {

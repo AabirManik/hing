@@ -77,7 +77,14 @@ export type ApiErrorCode =
   // B6: idempotency outcomes (§1.6) + purchase rejection (§4).
   | "IDEMPOTENCY_MISMATCH"
   | "IDEMPOTENCY_IN_PROGRESS"
-  | "INSUFFICIENT_FUNDS";
+  | "INSUFFICIENT_FUNDS"
+  // B8 (contract §1.4): verified-email gate + provider-config-absent.
+  | "EMAIL_NOT_VERIFIED"
+  | "SERVICE_UNAVAILABLE"
+  // B8b (user decision 2026-10-11): password login/register retired — Google only.
+  | "GOOGLE_SIGNIN_REQUIRED"
+  // B9 (contract §7.2): the mailbox must re-consent before Gmail sync can run.
+  | "RECONNECT_REQUIRED";
 
 // ------------------------------------------------------- B6 economy (contract §4) --
 
@@ -157,4 +164,82 @@ export interface GoogleStatusDto {
 export interface GoogleStartDto {
   /** Absolute Google consent URL — navigate the browser here. */
   authUrl: string;
+}
+
+// ------------------------------------------------------- Phase B9: Gmail inbox ---
+// Token material, history cursors, and raw provider payloads are server-only
+// and can never appear in these shapes. Bodies are PLAIN TEXT ONLY (HTML is
+// never rendered or stored, spec §5). Attachments are METADATA ONLY (never
+// bytes). Sync status is a persistent, player-visible state (spec §6).
+
+/** Persistent inbox sync status for one connected mailbox (spec §6). */
+export type GmailSyncStatus =
+  | "pending"
+  | "syncing"
+  | "synced"
+  | "delayed"
+  | "reconnect_required"
+  | "error";
+
+/** GET /api/v1/gmail/sync-status (`gmail.syncStatus`) success body. */
+export interface GmailSyncStatusDto {
+  /** False when no Google mailbox is connected — the UI shows "no mailbox". */
+  connected: boolean;
+  status: GmailSyncStatus;
+  /** Provider email of the connected mailbox (never a token). */
+  email: string | null;
+  /** Message count currently in the local inbox mirror. */
+  messageCount: number;
+  unreadCount: number;
+  /** Whether a sync job is currently queued/running (for progress UI). */
+  syncInFlight: boolean;
+  lastSyncedAt: string | null;
+  lastSuccessAt: string | null;
+  /** Safe error category (never a raw provider payload or stack). */
+  lastErrorClass: string | null;
+  /** The history window this mailbox imports (days; 30 by default). */
+  historyWindowDays: number;
+  /** True when the mailbox needs a fresh consent (revoked/invalid token). */
+  reconnectRequired: boolean;
+}
+
+/** One message summary in the inbox list (contract §7.2). */
+export interface GmailMessageSummaryDto {
+  id: string;
+  threadId: string | null;
+  sender: string;
+  subject: string | null;
+  snippet: string | null;
+  isUnread: boolean;
+  receivedAt: string;
+  hasAttachments: boolean;
+  attachmentCount: number;
+}
+
+/** GET /api/v1/gmail/messages (`gmail.messagesList`) success body. */
+export interface GmailMessageListDto {
+  messages: GmailMessageSummaryDto[];
+  /** Opaque cursor for the next page (newest-first); null = end of list. */
+  nextCursor: string | null;
+}
+
+/** GET /api/v1/gmail/messages/{id} (`gmail.messageGet`) success body. */
+export interface GmailMessageDetailDto {
+  id: string;
+  threadId: string | null;
+  sender: string;
+  subject: string | null;
+  /** PLAIN TEXT body only — never HTML (spec §5). */
+  bodyText: string | null;
+  isUnread: boolean;
+  receivedAt: string;
+  /** Metadata only — filename, MIME type, size. Never bytes (spec §5). */
+  attachments: { filename: string; mimeType: string; size: number }[];
+}
+
+/** POST /api/v1/gmail/sync (`gmail.syncStart`) success body (202). */
+export interface GmailSyncStartDto {
+  /** True when a sync job was newly enqueued; false when coalesced. */
+  enqueued: boolean;
+  status: GmailSyncStatus;
 }

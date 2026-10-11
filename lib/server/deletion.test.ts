@@ -218,9 +218,14 @@ describe("provider exposure stays minimal by construction", () => {
   const codeOnly = (source: string): string =>
     source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
-  it("no Google/Gmail/Gemini/OAuth/network/cloud-queue code in the queue/worker pipeline", () => {
+  it("no Google/Gemini/OAuth/network/cloud-queue code in the queue/worker pipeline", () => {
+    // B9 (phase_b9.md): the pipeline may route an approved `gmail.sync` JOB
+    // TYPE (a registry string) and delegate to lib/server/gmailSync.ts, but the
+    // worker pipeline itself must contain NO provider API surface or network
+    // primitive — the actual Gmail calls live only in lib/server/gmailApi.ts,
+    // which is not part of PIPELINE_SOURCES and is guarded separately.
     const forbidden =
-      /googleapis|gmail|gemini|oauth|gapi|fetch\s*\(|XMLHttpRequest|axios|calendar|cloud.?tasks|pub.?sub/i;
+      /googleapis|users\.(messages|threads|labels|drafts|settings|history)|gemini|oauth|gapi|fetch\s*\(|XMLHttpRequest|axios|calendar|cloud.?tasks|pub.?sub/i;
     for (const file of PIPELINE_SOURCES) {
       const code = codeOnly(readFileSync(`${process.cwd()}/${file}`, "utf8"));
       expect(forbidden.test(code), `${file} must not contain provider/queue-integration code`).toBe(false);
@@ -242,9 +247,12 @@ describe("provider exposure stays minimal by construction", () => {
     expect(importSpecifiers.filter((spec) => /google/i.test(spec))).toEqual(["@/lib/server/googleOAuth"]);
   });
 
-  it("only the approved job type is registered (no invented Gmail/Gemini jobs)", async () => {
+  it("only the approved job types are registered (deletion + the B9 gmail.sync)", async () => {
     const { JOB_HANDLERS } = await import("./worker");
-    expect(Object.keys(JOB_HANDLERS)).toEqual(["account.deletion"]);
+    // B7's account.deletion plus B9's approved gmail.sync (phase_b9.md §6).
+    // Anything else — especially Gemini — must not be registered.
+    expect(Object.keys(JOB_HANDLERS).sort()).toEqual(["account.deletion", "gmail.sync"]);
+    expect(Object.keys(JOB_HANDLERS)).not.toContain("gemini");
   });
 });
 

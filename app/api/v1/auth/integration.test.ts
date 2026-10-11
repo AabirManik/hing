@@ -21,8 +21,9 @@
 
 import { afterAll, describe, expect, it } from "vitest";
 import { getDb } from "@/lib/server/prisma";
+import { hashPassword } from "@/lib/server/password";
 import { hashSessionToken } from "@/lib/server/session";
-import { hashAuthToken } from "@/lib/server/tokens";
+import { generateAuthToken, hashAuthToken } from "@/lib/server/tokens";
 import { POST as loginPOST } from "./login/route";
 import { POST as logoutPOST } from "./logout/route";
 import { POST as forgotPOST } from "./password/forgot/route";
@@ -88,11 +89,35 @@ function cookieFor(response: Response): string {
   return `mailxp.session=${match?.[1]}`;
 }
 
+/**
+ * Seed a user + profile + session + verification token DIRECTLY against the
+ * real DB (the password register route is retired under Google-only). The
+ * DELETE route re-auths against the stored hash, so we store a real bcrypt
+ * hash of VALID_PW. Returns a session cookie + a raw verification token.
+ */
 async function register(email: string): Promise<{ cookie: string; token: string; playerId: string }> {
-  const response = await registerPOST(call("POST", "/auth/register", { body: { email, password: VALID_PW } }));
-  expect(response.status).toBe(201);
-  const body = (await response.json()) as { player: { id: string }; devDelivery?: { token: string } };
-  return { cookie: cookieFor(response), token: body.devDelivery?.token as string, playerId: body.player.id };
+  const db = getDb();
+  const passwordHash = await hashPassword(VALID_PW);
+  const user = await db.user.create({ data: { email, passwordHash } });
+  const raw = `live-seed-${email}-${Math.random().toString(36).slice(2)}`;
+  await db.session.create({
+    data: {
+      userId: user.id,
+      tokenHash: hashSessionToken(raw),
+      lastSeenAt: new Date(),
+      expiresAt: new Date(Date.now() + 1e9),
+    },
+  });
+  const token = generateAuthToken();
+  await db.authToken.create({
+    data: {
+      userId: user.id,
+      purpose: "EMAIL_VERIFICATION",
+      tokenHash: hashAuthToken(token),
+      expiresAt: new Date(Date.now() + 3_600_000),
+    },
+  });
+  return { cookie: `mailxp.session=${raw}`, token, playerId: user.id };
 }
 
 afterAll(async () => {
@@ -131,60 +156,39 @@ afterAll(async () => {
 });
 
 describe.runIf(DB_UP)("live DB integration (mailxp_dev)", () => {
-  it("register writes real rows: hashed password, hashed session/token, profile, audit", async () => {
+  it("register is retired (Google-only): 403 refusal writes NO real rows", async () => {
     const email = mail("reg");
-    const created = await register(email);
-    const db = getDb();
-
-    const user = await db.user.findUnique({ where: { email }, include: { profile: true } });
-    expect(user).toBeTruthy();
-    expect(user?.passwordHash).toMatch(/^\$2/);
-    expect(user?.passwordHash).not.toContain(VALID_PW);
-
-    expect(user?.profile).toBeTruthy();
-    expect((user?.profile?.prefs as Record<string, unknown>).masterVolume).toBe(0.8);
-    expect((user?.profile?.prefs as Record<string, unknown>).motion).toBe("full");
-
-    const rawSession = created.cookie.replace("mailxp.session=", "");
-    const session = await db.session.findUnique({ where: { tokenHash: hashSessionToken(rawSession) } });
-    expect(session).toBeTruthy();
-    expect(session?.tokenHash).not.toBe(rawSession);
-
-    const tokenRow = await db.authToken.findUnique({ where: { tokenHash: hashAuthToken(created.token) } });
-    expect(tokenRow?.purpose).toBe("EMAIL_VERIFICATION");
-    expect(tokenRow?.tokenHash).not.toBe(created.token);
-
-    const audits = await db.auditEvent.findMany({ where: { userId: user?.id, eventType: "auth.register" } });
-    expect(audits).toHaveLength(1);
-    expect(audits[0].requestId).toBeTruthy();
-  });
-
-  it("duplicate register hits the REAL unique constraint → 409 EMAIL_EXISTS", async () => {
-    const email = mail("dup");
-    await register(email);
     const response = await registerPOST(call("POST", "/auth/register", { body: { email, password: VALID_PW } }));
-    expect(response.status).toBe(409);
-    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("EMAIL_EXISTS");
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("GOOGLE_SIGNIN_REQUIRED");
+
+    // Nothing was minted against the real store.
+    const db = getDb();
+    expect(await db.user.findUnique({ where: { email } })).toBeNull();
   });
 
-  it("login rotates, /me reads the session, logout revokes for real", async () => {
+  it("login is retired (Google-only): 403 refusal even for a REAL seeded account", async () => {
+    const email = mail("dup");
+    const seeded = await register(email);
+    const response = await loginPOST(call("POST", "/auth/login", { body: { email, password: VALID_PW } }));
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("GOOGLE_SIGNIN_REQUIRED");
+    expect(seeded.playerId).toBeTruthy();
+  });
+
+  it("a seeded session reads /me and logout revokes it for real", async () => {
     const email = mail("cycle");
-    const first = await register(email);
+    const seeded = await register(email);
 
-    const login1 = await loginPOST(call("POST", "/auth/login", { body: { email, password: VALID_PW } }));
-    expect(login1.status).toBe(200);
-    const loginCookie = cookieFor(login1);
-    expect(loginCookie).not.toBe(first.cookie); // rotated
-
-    const me1 = await meGET(call("GET", "/me", { cookie: loginCookie }));
+    const me1 = await meGET(call("GET", "/me", { cookie: seeded.cookie }));
     expect(me1.status).toBe(200);
     const player = ((await me1.json()) as { player: Record<string, unknown> }).player;
     expect(Object.keys(player).sort()).toEqual(["createdAt", "email", "emailVerified", "id"]);
 
-    const logout = await logoutPOST(call("POST", "/auth/logout", { cookie: loginCookie }));
+    const logout = await logoutPOST(call("POST", "/auth/logout", { cookie: seeded.cookie }));
     expect(logout.status).toBe(204);
 
-    const me2 = await meGET(call("GET", "/me", { cookie: loginCookie }));
+    const me2 = await meGET(call("GET", "/me", { cookie: seeded.cookie }));
     expect(me2.status).toBe(401);
     expect(((await me2.json()) as { error: { code: string } }).error.code).toBe("SESSION_EXPIRED");
   });
@@ -239,25 +243,21 @@ describe.runIf(DB_UP)("live DB integration (mailxp_dev)", () => {
     expect(sessions.length).toBeGreaterThan(0);
     for (const session of sessions) expect(session.revokedAt).toBeTruthy();
 
-    // Old password dead / new password live against the REAL hash.
-    expect((await loginPOST(call("POST", "/auth/login", { body: { email, password: VALID_PW } }))).status).toBe(401);
-    expect((await loginPOST(call("POST", "/auth/login", { body: { email, password: NEW_PW } }))).status).toBe(200);
+    // Login is retired — even a valid password can never enter (Google-only).
+    expect((await loginPOST(call("POST", "/auth/login", { body: { email, password: NEW_PW } }))).status).toBe(403);
 
     // Single-use: replay → 404.
     expect((await resetPOST(call("POST", "/auth/password/reset", { body: { token, password: "another-good-pass" } }))).status).toBe(404);
   });
 
-  it("uniform 401s against the real store (unknown email == wrong password)", async () => {
+  it("login is uniformly refused against the real store (retired — Google-only)", async () => {
     const email = mail("uniform");
     await register(email);
-    const wrong = await loginPOST(call("POST", "/auth/login", { body: { email, password: "wrong-password-x" } }, ), );
+    const known = await loginPOST(call("POST", "/auth/login", { body: { email, password: VALID_PW } }));
     const ghost = await loginPOST(call("POST", "/auth/login", { body: { email: mail("ghost"), password: "wrong-password-x" } }));
-    expect(wrong.status).toBe(401);
-    expect(ghost.status).toBe(401);
-    const [a, b] = [await wrong.json(), await ghost.json()];
-    (a as { error: { requestId: string } }).error.requestId = "same";
-    (b as { error: { requestId: string } }).error.requestId = "same";
-    expect(a).toEqual(b);
+    expect(known.status).toBe(403);
+    expect(ghost.status).toBe(403);
+    expect(((await known.json()) as { error: { code: string } }).error.code).toBe("GOOGLE_SIGNIN_REQUIRED");
   });
 
   it("DELETE /me: real re-auth → 202, marker set, sessions revoked, retry 401, login blocked", async () => {
@@ -282,8 +282,9 @@ describe.runIf(DB_UP)("live DB integration (mailxp_dev)", () => {
     const sessions = await db.session.findMany({ where: { userId: created.playerId } });
     for (const session of sessions) expect(session.revokedAt).toBeTruthy();
 
-    // Login disabled immediately (uniform 401 — state not disclosed)…
-    expect((await loginPOST(call("POST", "/auth/login", { body: { email, password: VALID_PW } }))).status).toBe(401);
+    // Login is retired — a password can never enter (Google-only), whatever
+    // the account state.
+    expect((await loginPOST(call("POST", "/auth/login", { body: { email, password: VALID_PW } }))).status).toBe(403);
     // …retry of the delete is safe (session dead → 401, no duplicate work)…
     const retry = await meDELETE(call("DELETE", "/me", { cookie: created.cookie, body: { password: VALID_PW } }));
     expect(retry.status).toBe(401);

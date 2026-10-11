@@ -48,6 +48,9 @@ export const GOOGLE_AUDIT_EVENTS = [
   "google.disconnected",
   "google.released",
   "google.link_conflict",
+  // B9: a mailbox sync was requested (enqueued). Meta carries only the
+  // internal connectionId and the trigger source — never email content.
+  "gmail.sync_requested",
 ] as const;
 
 export type AuthAuditEvent = (typeof AUTH_AUDIT_EVENTS)[number];

@@ -424,6 +424,116 @@ describe("linkGoogleIdentity (spec §4.7–§4.9)", () => {
   });
 });
 
+// ------------------------------------------------ B8b: one Gmail per user ---
+
+describe("B8b: one connected Gmail per MailXP user (phase_b8b.md §3/§5)", () => {
+  it("a user who already has a DIFFERENT connected sub is refused — no second mailbox", async () => {
+    const userId = await makeUser("one-mailbox@example.test");
+    const first = await linkGoogleIdentity(fake.client, {
+      userId,
+      identity: { sub: "sub-a", email: "a@gmail.com" },
+      refreshToken: "rt-a",
+      grantedScopes: "openid",
+      encryptionKey: KEY,
+    });
+    expect(first.ok).toBe(true);
+
+    const attempt = await linkGoogleIdentity(fake.client, {
+      userId,
+      identity: { sub: "sub-b", email: "b@gmail.com" },
+      refreshToken: "rt-b",
+      grantedScopes: "openid",
+      encryptionKey: KEY,
+    });
+    expect(attempt).toEqual({ ok: false, reason: "conflict" });
+    // Still exactly ONE row, still sub-a, credentials untouched.
+    expect(fake.googleConnections).toHaveLength(1);
+    expect(fake.googleConnections[0].googleSub).toBe("sub-a");
+    expect(openStoredRefreshToken(fake.googleConnections[0] as never, KEY)).toBe("rt-a");
+  });
+
+  it("reconnecting the SAME sub is still allowed (reconnect/update in place)", async () => {
+    const userId = await makeUser("reconnect-ok@example.test");
+    await linkGoogleIdentity(fake.client, {
+      userId,
+      identity: { sub: "sub-same", email: "same@gmail.com" },
+      refreshToken: "rt-1",
+      grantedScopes: "openid",
+      encryptionKey: KEY,
+    });
+    const again = await linkGoogleIdentity(fake.client, {
+      userId,
+      identity: { sub: "sub-same", email: "same@gmail.com" },
+      refreshToken: "rt-2",
+      grantedScopes: "openid email gmail.modify",
+      encryptionKey: KEY,
+    });
+    expect(again.ok && again.outcome).toBe("reconnected");
+    expect(fake.googleConnections).toHaveLength(1);
+  });
+
+  it("after an explicit release the same user MAY connect a different sub (switch flow)", async () => {
+    const userId = await makeUser("switch@example.test");
+    const first = await linkGoogleIdentity(fake.client, {
+      userId,
+      identity: { sub: "sub-old", email: "old@gmail.com" },
+      refreshToken: "rt-old",
+      grantedScopes: "openid",
+      encryptionKey: KEY,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    // Explicit release: status flipped + sealed columns wiped in place (the
+    // route's exact semantics) — this is the sanctioned precondition.
+    await fake.client.googleConnection.update({
+      where: { id: first.account.id },
+      data: { status: "released", refreshTokenCipher: null, refreshTokenNonce: null, refreshTokenTag: null },
+    });
+
+    const attempt = await linkGoogleIdentity(fake.client, {
+      userId,
+      identity: { sub: "sub-new", email: "new@gmail.com" },
+      refreshToken: "rt-new",
+      grantedScopes: "openid",
+      encryptionKey: KEY,
+    });
+    expect(attempt.ok).toBe(true);
+    expect(fake.googleConnections.filter((r) => r.status === "connected")).toHaveLength(1);
+    expect(fake.googleConnections.find((r) => r.status === "connected")?.googleSub).toBe("sub-new");
+  });
+
+  it("the database invariant rejects a second CONNECTED row for one user (P2002)", async () => {
+    const userId = await makeUser("db-invariant@example.test");
+    await fake.client.googleConnection.create({
+      data: { userId, googleSub: "inv-1", email: "i1@gmail.com", scopes: "" },
+    });
+    await expect(
+      fake.client.googleConnection.create({
+        data: { userId, googleSub: "inv-2", email: "i2@gmail.com", scopes: "" },
+      }),
+    ).rejects.toMatchObject({ code: "P2002" });
+  });
+
+  it("released historical rows for one user do NOT trip the invariant", async () => {
+    const userId = await makeUser("history@example.test");
+    const a = await fake.client.googleConnection.create({
+      data: { userId, googleSub: "hist-1", email: "h1@gmail.com", scopes: "" },
+    });
+    await fake.client.googleConnection.update({
+      where: { id: a.id },
+      data: { status: "released", refreshTokenCipher: null, refreshTokenNonce: null, refreshTokenTag: null },
+    });
+    // A released row + a new connected row coexist legally.
+    await expect(
+      fake.client.googleConnection.create({
+        data: { userId, googleSub: "hist-2", email: "h2@gmail.com", scopes: "" },
+      }),
+    ).resolves.toBeTruthy();
+    expect(fake.googleConnections.filter((r) => r.userId === userId)).toHaveLength(2);
+    expect(fake.googleConnections.filter((r) => r.userId === userId && r.status === "connected")).toHaveLength(1);
+  });
+});
+
 // -------------------------------------------------------------------- DTOs ---
 
 describe("toGoogleAccountDto (spec §4.10 — no token leakage)", () => {

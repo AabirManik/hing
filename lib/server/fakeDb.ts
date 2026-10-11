@@ -37,6 +37,8 @@ export interface FakeDb {
   jobs: Row[];
   googleConnections: Row[];
   oauthStates: Row[];
+  gmailMessages: Row[];
+  gmailSyncStates: Row[];
   client: PrismaClient;
   reset(): void;
 }
@@ -160,6 +162,8 @@ export function createFakeDb(): FakeDb {
     jobs: [],
     googleConnections: [],
     oauthStates: [],
+    gmailMessages: [],
+    gmailSyncStates: [],
     client: null as unknown as PrismaClient,
     reset() {
       fake.users.length = 0;
@@ -174,6 +178,8 @@ export function createFakeDb(): FakeDb {
       fake.jobs.length = 0;
       fake.googleConnections.length = 0;
       fake.oauthStates.length = 0;
+      fake.gmailMessages.length = 0;
+      fake.gmailSyncStates.length = 0;
     },
   };
 
@@ -193,6 +199,8 @@ export function createFakeDb(): FakeDb {
     fake.jobs,
     fake.googleConnections,
     fake.oauthStates,
+    fake.gmailMessages,
+    fake.gmailSyncStates,
   ];
 
   // Transactions are QUEUED, not interleaved: real PostgreSQL serializes
@@ -661,6 +669,16 @@ export function createFakeDb(): FakeDb {
         if (fake.googleConnections.some((row) => row.googleSub === data.googleSub)) {
           throw { code: "P2002" };
         }
+        // B8b partial unique index: at most ONE connected row per user
+        // (mirrors GoogleConnection_userId_connected_key ... WHERE status='connected').
+        if (
+          (data.status ?? "connected") === "connected" &&
+          fake.googleConnections.some(
+            (row) => row.userId === data.userId && row.status === "connected",
+          )
+        ) {
+          throw { code: "P2002" };
+        }
         const now = new Date();
         const row: Row = {
           id: uuidish("gcon"),
@@ -679,6 +697,9 @@ export function createFakeDb(): FakeDb {
       },
       async findUnique({ where }: { where: Record<string, unknown> }) {
         return fake.googleConnections.find((row) => matchWhere(row, where)) ?? null;
+      },
+      async findFirst({ where }: { where?: Record<string, unknown> }) {
+        return fake.googleConnections.find((row) => (where ? matchWhere(row, where) : true)) ?? null;
       },
       async findMany({
         where,
@@ -739,6 +760,173 @@ export function createFakeDb(): FakeDb {
       },
       async deleteMany({ where }: { where: Record<string, unknown> }) {
         return deleteManyFrom(fake.oauthStates, where);
+      },
+    },
+
+    // ---- B9 Gmail sync ------------------------------------------------------
+    gmailMessage: {
+      async create({ data }: { data: Row }) {
+        const row: Row = {
+          id: uuidish("gmsg"),
+          syncedAt: new Date(),
+          labels: [],
+          attachments: [],
+          isUnread: true,
+          ...data,
+        };
+        fake.gmailMessages.push(row);
+        return row;
+      },
+      async upsert({
+        where,
+        create,
+        update,
+      }: {
+        where: { googleConnectionId_gmailMessageId: { googleConnectionId: string; gmailMessageId: string } };
+        create: Row;
+        update: Row;
+      }) {
+        const key = where.googleConnectionId_gmailMessageId;
+        const existing = fake.gmailMessages.find(
+          (row) => row.googleConnectionId === key.googleConnectionId && row.gmailMessageId === key.gmailMessageId,
+        );
+        if (existing) {
+          applyUpdate(existing, update);
+          existing.syncedAt = new Date();
+          return existing;
+        }
+        const row: Row = { id: uuidish("gmsg"), syncedAt: new Date(), labels: [], attachments: [], isUnread: true, ...create };
+        fake.gmailMessages.push(row);
+        return row;
+      },
+      async findUnique({ where }: { where: Record<string, unknown> }) {
+        return fake.gmailMessages.find((row) => matchWhere(row, where)) ?? null;
+      },
+      async findFirst({ where }: { where?: Record<string, unknown> }) {
+        return fake.gmailMessages.find((row) => (where ? matchWhere(row, where) : true)) ?? null;
+      },
+      async findMany({
+        where,
+        orderBy,
+        take,
+        skip,
+      }: {
+        where?: Record<string, unknown>;
+        orderBy?: unknown;
+        take?: number;
+        skip?: number;
+      }) {
+        let rows = fake.gmailMessages.filter((row) => (where ? matchWhere(row, where) : true));
+        rows = sortRows(rows, orderBy);
+        if (typeof skip === "number") rows = rows.slice(skip);
+        return typeof take === "number" ? rows.slice(0, take) : rows;
+      },
+      async count({ where }: { where?: Record<string, unknown> }) {
+        return fake.gmailMessages.filter((row) => (where ? matchWhere(row, where) : true)).length;
+      },
+      async update({ where, data }: { where: Record<string, unknown>; data: Row }) {
+        const row = fake.gmailMessages.find((r) => matchWhere(r, where));
+        if (!row) throw { code: "P2025" };
+        applyUpdate(row, data);
+        return row;
+      },
+      async updateMany({ where, data }: { where: Record<string, unknown>; data: Row }) {
+        return updateManyIn(fake.gmailMessages, where, data);
+      },
+      async delete({ where }: { where: Record<string, unknown> }) {
+        const index = fake.gmailMessages.findIndex((r) => matchWhere(r, where));
+        if (index === -1) throw { code: "P2025" };
+        const [row] = fake.gmailMessages.splice(index, 1);
+        return row;
+      },
+      async deleteMany({ where }: { where: Record<string, unknown> }) {
+        return deleteManyFrom(fake.gmailMessages, where);
+      },
+    },
+
+    gmailSyncState: {
+      async create({ data }: { data: Row }) {
+        const now = new Date();
+        const row: Row = {
+          id: uuidish("gsync"),
+          status: "pending",
+          historyId: null,
+          historyWindowDays: 30,
+          lastSyncedAt: null,
+          lastSuccessAt: null,
+          nextReconcileAt: null,
+          lastErrorClass: null,
+          createdAt: now,
+          updatedAt: now,
+          ...data,
+        };
+        fake.gmailSyncStates.push(row);
+        return row;
+      },
+      async upsert({
+        where,
+        create,
+        update,
+      }: {
+        where: { googleConnectionId: string };
+        create: Row;
+        update: Row;
+      }) {
+        const existing = fake.gmailSyncStates.find((row) => row.googleConnectionId === where.googleConnectionId);
+        if (existing) {
+          applyUpdate(existing, update);
+          existing.updatedAt = new Date();
+          return existing;
+        }
+        const now = new Date();
+        const row: Row = {
+          id: uuidish("gsync"),
+          status: "pending",
+          historyId: null,
+          historyWindowDays: 30,
+          lastSyncedAt: null,
+          lastSuccessAt: null,
+          nextReconcileAt: null,
+          lastErrorClass: null,
+          createdAt: now,
+          updatedAt: now,
+          googleConnectionId: where.googleConnectionId,
+          ...create,
+        };
+        fake.gmailSyncStates.push(row);
+        return row;
+      },
+      async findUnique({ where }: { where: Record<string, unknown> }) {
+        return fake.gmailSyncStates.find((row) => matchWhere(row, where)) ?? null;
+      },
+      async findFirst({ where }: { where?: Record<string, unknown> }) {
+        return fake.gmailSyncStates.find((row) => (where ? matchWhere(row, where) : true)) ?? null;
+      },
+      async findMany({
+        where,
+        orderBy,
+        take,
+      }: {
+        where?: Record<string, unknown>;
+        orderBy?: unknown;
+        take?: number;
+      }) {
+        let rows = fake.gmailSyncStates.filter((row) => (where ? matchWhere(row, where) : true));
+        rows = sortRows(rows, orderBy);
+        return typeof take === "number" ? rows.slice(0, take) : rows;
+      },
+      async update({ where, data }: { where: Record<string, unknown>; data: Row }) {
+        const row = fake.gmailSyncStates.find((r) => matchWhere(r, where));
+        if (!row) throw { code: "P2025" };
+        applyUpdate(row, data);
+        row.updatedAt = new Date();
+        return row;
+      },
+      async updateMany({ where, data }: { where: Record<string, unknown>; data: Row }) {
+        return updateManyIn(fake.gmailSyncStates, where, data);
+      },
+      async deleteMany({ where }: { where: Record<string, unknown> }) {
+        return deleteManyFrom(fake.gmailSyncStates, where);
       },
     },
   };

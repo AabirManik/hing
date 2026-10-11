@@ -51,6 +51,7 @@ import {
 } from "@/lib/server/jobQueue";
 import { relayOutboxEvents, type RelayDb } from "@/lib/server/outbox";
 import { runAccountDeletion, type DeletionDb } from "@/lib/server/deletion";
+import { runGmailSync, type GmailSyncDb } from "@/lib/server/gmailSync";
 
 // ---------------------------------------------------------------------------
 // Handler registry — the ONLY code the worker may execute for a job.
@@ -70,13 +71,16 @@ export type JobHandlerRegistry = Record<string, JobHandler>;
 /** Every B7 job type (phase_b7.md §8: only grounded, approved types). */
 export const JOB_HANDLERS: JobHandlerRegistry = {
   "account.deletion": async ({ db, payload, requestId }) => runAccountDeletion(db, payload, requestId),
+  "gmail.sync": async ({ db, payload, requestId }) => {
+    await runGmailSync(db as unknown as GmailSyncDb, payload, requestId);
+  },
 };
 
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
 
-export type WorkerDb = QueueDb & RelayDb & DeletionDb;
+export type WorkerDb = QueueDb & RelayDb & DeletionDb & GmailSyncDb;
 
 export interface WorkerOptions {
   /** Injectable database (tests pass the fake); default lazy getDb(). */

@@ -1,22 +1,25 @@
 /**
- * Phase B4 — auth route tests (MOCKED storage: in-memory fake DB; real
- * bcryptjs hashing and real token generation/hashing).
- * The live suite (integration.test.ts, same folder) repeats these flows
- * against the real mailxp_dev database and is clearly labelled as live.
+ * Auth route tests (MOCKED storage: in-memory fake DB; real bcryptjs hashing
+ * and real token generation/hashing).
  *
- * Covers the phase_b4 §9 minimum: registration validation/success/409/
- * hash-not-plaintext; uniform 401s; session opacity + hash-only storage;
- * cookie flags + production Secure + rotation; logout revocation; verification
- * token invalid/expired/consumed/replay; resend/forgot always-202; reset
- * expiry/single-use/revokes-all; password policy; Origin rejection on every
- * mutation; all four rate classes; secrets never in logs/responses;
- * request-ID propagation; production devDelivery suppression.
+ * Google-only entrance (user decision 2026-10-11): password register/login are
+ * RETIRED — both routes answer 403 GOOGLE_SIGNIN_REQUIRED so no dummy account
+ * or password-entry is possible even via a direct API call. Every other auth
+ * route (logout, verify-email, resend, forgot/reset) still needs a live user
+ * + session to exercise, so this suite SEEDS them directly against the fakeDb
+ * (the Google sign-in callback is the only path that creates accounts now).
+ *
+ * Covers: register/login refusal (+ origin still gated); logout revocation;
+ * verification token invalid/expired/consumed/replay; resend/forgot always-202;
+ * reset expiry/single-use/revokes-all; origin rejection on every mutation;
+ * secrets never in logs/responses; request-ID propagation.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeDb, type FakeDb } from "@/lib/server/fakeDb";
+import { hashPassword } from "@/lib/server/password";
 import { hashSessionToken } from "@/lib/server/session";
-import { hashAuthToken } from "@/lib/server/tokens";
+import { hashAuthToken, issueToken } from "@/lib/server/tokens";
 
 vi.mock("@/lib/server/prisma", () => ({ getDb: vi.fn() }));
 
@@ -81,97 +84,54 @@ function cookieFor(response: Response): string {
   return `mailxp.session=${match?.[1]}`;
 }
 
-async function registerUser(
+/**
+ * Seed a user + profile + session + verification token DIRECTLY (the register
+ * route is retired). Returns a session cookie, a raw verification token, and
+ * the player id — the same shape the old registerUser produced, so downstream
+ * route tests are unchanged.
+ */
+async function seedUser(
   email = "player1@example.com",
-  ip = nextIp(),
-  password = VALID_PW,
+  opts: { verified?: boolean } = {},
 ): Promise<{ cookie: string; token: string; playerId: string }> {
-  const response = await registerPOST(post("/auth/register", { email, password }, { ip }));
-  expect(response.status).toBe(201);
-  const body = (await response.json()) as { player: { id: string }; devDelivery?: { token: string } };
-  expect(body.devDelivery).toBeTruthy(); // dev-mode surfacing (NODE_ENV=test)
-  return { cookie: cookieFor(response), token: body.devDelivery?.token as string, playerId: body.player.id };
+  const passwordHash = await hashPassword(VALID_PW);
+  const user = (await fake.client.user.create({
+    data: { email, passwordHash, ...(opts.verified ? { emailVerifiedAt: new Date() } : {}) },
+  })) as { id: string };
+  await fake.client.playerProfile.create({ data: { userId: user.id, prefs: {} } });
+  const raw = `seed-session-${email}-${Math.random().toString(36).slice(2)}`;
+  await fake.client.session.create({
+    data: {
+      userId: user.id,
+      tokenHash: hashSessionToken(raw),
+      lastSeenAt: new Date(),
+      expiresAt: new Date(Date.now() + 1e9),
+    },
+  });
+  const verification = await issueToken(fake.client, user.id, "EMAIL_VERIFICATION");
+  return { cookie: `mailxp.session=${raw}`, token: verification.token, playerId: user.id };
 }
 
 // --------------------------------------------------------------- register --
 
-describe("POST /api/v1/auth/register", () => {
-  it("201: full contract, hashed password, hashed token, profile, session hash, audit, dev token", async () => {
+describe("POST /api/v1/auth/register (retired — Google-only)", () => {
+  it("refuses with 403 GOOGLE_SIGNIN_REQUIRED and creates nothing", async () => {
     const response = await registerPOST(
       post("/auth/register", { email: "  Newbie@Example.COM ", password: VALID_PW }),
     );
-    expect(response.status).toBe(201);
-    const body = (await response.json()) as {
-      player: Record<string, unknown>;
-      devDelivery?: { token: string };
-    };
-    const player = body.player;
-    expect(Object.keys(player).sort()).toEqual(["createdAt", "email", "emailVerified", "id"]);
-    expect(player.email).toBe("newbie@example.com"); // trimmed + lowercased
-    expect(player.emailVerified).toBe(false);
-    expect(new Date(player.createdAt as string).toISOString()).toBe(player.createdAt); // ISO 8601
-
-    // Cookie attributes (dev: no Secure) — B1 §1.2.
-    const cookie = setCookieOf(response);
-    expect(cookie).toContain("httponly");
-    expect(cookie).toContain("samesite=lax");
-    expect(cookie).toContain("path=/");
-    expect(cookie).toContain("max-age=2592000");
-    expect(cookie).not.toContain("secure");
-
-    // Storage reality:
-    const user = fake.users[0];
-    expect(user.passwordHash).toMatch(/^\$2/);
-    expect(user.passwordHash).not.toBe(VALID_PW);
-    expect(String(user.passwordHash)).not.toContain(VALID_PW);
-    expect(fake.profiles).toHaveLength(1);
-    expect(fake.profiles[0].prefs).toEqual({
-      masterVolume: 0.8,
-      uiVolume: 0.9,
-      gameVolume: 0.8,
-      muted: false,
-      motion: "full",
-      touchControls: "auto",
-    });
-    const rawToken = cookieFor(response).replace("mailxp.session=", ""); // raw (not lowercased)
-    expect(fake.sessions[0].tokenHash).toBe(hashSessionToken(rawToken));
-    expect(fake.sessions[0].tokenHash).not.toBe(rawToken);
-    expect(fake.tokens[0].tokenHash).not.toBe(body.devDelivery?.token);
-    expect(fake.audits.map((a) => a.eventType)).toContain("auth.register");
-  });
-
-  it("409 EMAIL_EXISTS on duplicate (documented enumeration trade-off)", async () => {
-    await registerUser("dup@example.com");
-    const response = await registerPOST(
-      post("/auth/register", { email: "dup@example.com", password: VALID_PW }),
-    );
-    expect(response.status).toBe(409);
-    const body = (await response.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("EMAIL_EXISTS");
-  });
-
-  it("400 validation: bad email, short password, common password — details name fields only", async () => {
-    const badEmail = await registerPOST(post("/auth/register", { email: "nope", password: VALID_PW }));
-    expect(badEmail.status).toBe(400);
-    const short = await registerPOST(post("/auth/register", { email: "ok@x.co", password: "short" }));
-    expect(short.status).toBe(400);
-    const common = await registerPOST(post("/auth/register", { email: "ok@x.co", password: "password123" }));
-    expect(common.status).toBe(400);
-    const body = (await common.json()) as { error: { code: string; details: { field: string }[] } };
-    expect(body.error.code).toBe("VALIDATION_ERROR");
-    expect(body.error.details.some((d) => d.field === "password")).toBe(true);
-    // never echo the submitted password back:
-    expect(JSON.stringify(body)).not.toContain("password123");
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("GOOGLE_SIGNIN_REQUIRED");
+    expect(body.error.message).toContain("continue with Google");
+    // No dummy account, no session, no profile, no token — nothing minted.
     expect(fake.users).toHaveLength(0);
+    expect(fake.sessions).toHaveLength(0);
+    expect(fake.profiles).toHaveLength(0);
+    expect(fake.tokens).toHaveLength(0);
+    expect(response.headers.get("set-cookie")).toBeNull();
   });
 
-  it("400 on malformed JSON", async () => {
-    const response = await registerPOST(post("/auth/register", "{not-json"));
-    expect(response.status).toBe(400);
-    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("VALIDATION_ERROR");
-  });
-
-  it("403 on missing or cross-site Origin (public route still protected)", async () => {
+  it("still rejects a missing/cross-site Origin with 403 BEFORE the refusal", async () => {
     const noOrigin = await registerPOST(post("/auth/register", { email: "a@x.co", password: VALID_PW }, { origin: null }));
     expect(noOrigin.status).toBe(403);
     expect(((await noOrigin.json()) as { error: { code: string } }).error.code).toBe("CSRF_ORIGIN_REJECTED");
@@ -182,22 +142,9 @@ describe("POST /api/v1/auth/register", () => {
     expect(fake.users).toHaveLength(0);
   });
 
-  it("429 register class: 5/hour per IP then Retry-After", async () => {
-    const ip = nextIp();
-    for (let i = 0; i < 5; i += 1) {
-      // Body never reached: rate is consumed before parsing (cheap 400s).
-      expect((await registerPOST(post("/auth/register", "{bad", { ip }))).status).toBe(400);
-    }
-    const blocked = await registerPOST(post("/auth/register", { email: "x@y.co", password: VALID_PW }, { ip }));
-    expect(blocked.status).toBe(429);
-    expect(blocked.headers.get("Retry-After")).toBeTruthy();
-    expect(((await blocked.json()) as { error: { code: string } }).error.code).toBe("RATE_LIMITED");
-  });
-
-  it("propagates a safe inbound X-Request-Id through success and failure", async () => {
-    const ok = await registerPOST(post("/auth/register", { email: "rid@x.co", password: VALID_PW }, { requestId: "req-id-12345678" }));
-    expect(ok.headers.get("X-Request-Id")).toBe("req-id-12345678");
+  it("propagates a safe inbound X-Request-Id through the refusal", async () => {
     const fail = await registerPOST(post("/auth/register", { email: "bad" }, { requestId: "req-id-12345678" }));
+    expect(fail.headers.get("X-Request-Id")).toBe("req-id-12345678");
     const body = (await fail.json()) as { error: { requestId: string } };
     expect(body.error.requestId).toBe("req-id-12345678");
   });
@@ -205,120 +152,73 @@ describe("POST /api/v1/auth/register", () => {
 
 // ------------------------------------------------------------------ login --
 
-describe("POST /api/v1/auth/login", () => {
-  it("unknown email and wrong password are byte-identical 401 envelopes", async () => {
-    await registerUser("known@example.com");
-    const wrong = await loginPOST(
-      post("/auth/login", { email: "known@example.com", password: "not-the-password" }, { requestId: "fixed-rid-0001" }),
-    );
-    const ghost = await loginPOST(
-      post("/auth/login", { email: "ghost@example.com", password: "not-the-password" }, { requestId: "fixed-rid-0001" }),
-    );
-    expect(wrong.status).toBe(401);
-    expect(ghost.status).toBe(401);
-    const [a, b] = [await wrong.json(), await ghost.json()];
-    expect(a).toEqual(b);
-    expect((a as { error: { code: string } }).error.code).toBe("INVALID_CREDENTIALS");
-    expect((a as { error: { message: string } }).error.message).toBe("Invalid email or password.");
-  });
-
-  it("syntactically invalid email follows the same uniform 401 path", async () => {
-    const response = await loginPOST(post("/auth/login", { email: "not-an-email", password: VALID_PW }));
-    expect(response.status).toBe(401);
-    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("INVALID_CREDENTIALS");
-  });
-
-  it("deletion-pending accounts cannot log in (uniform 401 — state not disclosed)", async () => {
-    await registerUser("pending@example.com");
-    fake.users[0].deletionRequestedAt = new Date();
-    const response = await loginPOST(post("/auth/login", { email: "pending@example.com", password: VALID_PW }));
-    expect(response.status).toBe(401);
-    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("INVALID_CREDENTIALS");
-  });
-
-  it("success returns the player, rotates the session, audits login", async () => {
-    const registered = await registerUser("alice@example.com");
+describe("POST /api/v1/auth/login (retired — Google-only)", () => {
+  it("refuses with 403 GOOGLE_SIGNIN_REQUIRED even for a REAL seeded account", async () => {
+    await seedUser("known@example.com");
     const response = await loginPOST(
-      post("/auth/login", { email: "alice@example.com", password: VALID_PW }, { cookie: registered.cookie }),
+      post("/auth/login", { email: "known@example.com", password: VALID_PW }),
     );
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { player: Record<string, unknown> };
-    expect(Object.keys(body.player).sort()).toEqual(["createdAt", "email", "emailVerified", "id"]);
-
-    // Rotation: fresh token issued, presented session revoked.
-    const newCookie = cookieFor(response);
-    expect(newCookie).not.toBe(registered.cookie);
-    const oldRaw = registered.cookie.replace("mailxp.session=", "");
-    const oldRow = fake.sessions.find((s) => s.tokenHash === hashSessionToken(oldRaw));
-    expect(oldRow?.revokedAt).toBeTruthy();
-    expect(fake.audits.map((a) => a.eventType)).toContain("auth.login");
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("GOOGLE_SIGNIN_REQUIRED");
+    // No session was issued for the password attempt.
+    expect(fake.sessions).toHaveLength(1); // only the seeded one
   });
 
-  it("structural body problems are 400 (schema violation, not a credential outcome)", async () => {
-    expect((await loginPOST(post("/auth/login", { password: VALID_PW }))).status).toBe(400);
-    expect((await loginPOST(post("/auth/login", { email: "a@b.co" }))).status).toBe(400);
-    expect((await loginPOST(post("/auth/login", { email: 5, password: VALID_PW }))).status).toBe(400);
+  it("never authenticates an unknown email either (uniform refusal)", async () => {
+    const ghost = await loginPOST(post("/auth/login", { email: "ghost@example.com", password: "x" }));
+    expect(ghost.status).toBe(403);
+    expect(((await ghost.json()) as { error: { code: string } }).error.code).toBe("GOOGLE_SIGNIN_REQUIRED");
+    expect(response(ghost).headers.get("set-cookie")).toBeNull();
   });
 
-  it("login rate: 10/15min per email+IP, 11th is 429", async () => {
-    const ip = nextIp();
-    for (let i = 0; i < 10; i += 1) {
-      const response = await loginPOST(
-        post("/auth/login", { email: "flood@example.com", password: "wrong-password-x" }, { ip }),
-      );
-      expect(response.status).toBe(401);
-    }
-    const blocked = await loginPOST(
-      post("/auth/login", { email: "flood@example.com", password: "wrong-password-x" }, { ip }),
-    );
-    expect(blocked.status).toBe(429);
-    expect(blocked.headers.get("Retry-After")).toBeTruthy();
-  });
-
-  it("failed logins audit without distinguishing cause", async () => {
-    await registerUser("audit@example.com");
-    await loginPOST(post("/auth/login", { email: "audit@example.com", password: "wrong-password-x" }));
-    await loginPOST(post("/auth/login", { email: "nobody-here@example.com", password: "wrong-password-x" }));
-    const failures = fake.audits.filter((a) => a.eventType === "auth.login_failed");
-    expect(failures).toHaveLength(2);
-    expect(JSON.stringify(failures)).not.toContain("nobody-here"); // no email in audit meta
+  it("still rejects a missing/cross-site Origin with 403 BEFORE the refusal", async () => {
+    const noOrigin = await loginPOST(post("/auth/login", { email: "a@b.co", password: VALID_PW }, { origin: null }));
+    expect(noOrigin.status).toBe(403);
+    expect(((await noOrigin.json()) as { error: { code: string } }).error.code).toBe("CSRF_ORIGIN_REJECTED");
+    const cross = await loginPOST(post("/auth/login", { email: "a@b.co", password: VALID_PW }, { origin: "https://evil.example" }));
+    expect(cross.status).toBe(403);
   });
 });
+
+function response(r: Response): Response {
+  return r;
+}
 
 // ---------------------------------------------------------------- logout --
 
 describe("POST /api/v1/auth/logout", () => {
   it("no cookie at all → 401 UNAUTHENTICATED", async () => {
-    const response = await logoutPOST(post("/auth/logout", undefined));
-    expect(response.status).toBe(401);
-    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
+    const result = await logoutPOST(post("/auth/logout", undefined));
+    expect(result.status).toBe(401);
+    expect(((await result.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
   });
 
   it("valid session → 204, revoked server-side, cookie cleared, audited", async () => {
-    const registered = await registerUser("out@example.com");
-    const response = await logoutPOST(post("/auth/logout", undefined, { cookie: registered.cookie }));
-    expect(response.status).toBe(204);
-    const cleared = setCookieOf(response);
+    const seeded = await seedUser("out@example.com");
+    const result = await logoutPOST(post("/auth/logout", undefined, { cookie: seeded.cookie }));
+    expect(result.status).toBe(204);
+    const cleared = setCookieOf(result);
     expect(cleared).toContain("max-age=0");
     expect(cleared).toContain("httponly");
-    const raw = registered.cookie.replace("mailxp.session=", "");
+    const raw = seeded.cookie.replace("mailxp.session=", "");
     const row = fake.sessions.find((s) => s.tokenHash === hashSessionToken(raw));
     expect(row?.revokedAt).toBeTruthy();
     expect(fake.audits.filter((a) => a.eventType === "auth.logout")).toHaveLength(1);
   });
 
   it("already-dead session → 204 idempotent-tolerant, no duplicate audit", async () => {
-    const registered = await registerUser("twice@example.com");
-    expect((await logoutPOST(post("/auth/logout", undefined, { cookie: registered.cookie }))).status).toBe(204);
-    expect((await logoutPOST(post("/auth/logout", undefined, { cookie: registered.cookie }))).status).toBe(204);
+    const seeded = await seedUser("twice@example.com");
+    expect((await logoutPOST(post("/auth/logout", undefined, { cookie: seeded.cookie }))).status).toBe(204);
+    expect((await logoutPOST(post("/auth/logout", undefined, { cookie: seeded.cookie }))).status).toBe(204);
     expect(fake.audits.filter((a) => a.eventType === "auth.logout")).toHaveLength(1);
   });
 
   it("cross-site Origin is rejected before anything else", async () => {
-    const registered = await registerUser("csrf@example.com");
-    const response = await logoutPOST(post("/auth/logout", undefined, { cookie: registered.cookie, origin: "https://evil.example" }));
-    expect(response.status).toBe(403);
-    const raw = registered.cookie.replace("mailxp.session=", "");
+    const seeded = await seedUser("csrf@example.com");
+    const result = await logoutPOST(post("/auth/logout", undefined, { cookie: seeded.cookie, origin: "https://evil.example" }));
+    expect(result.status).toBe(403);
+    const raw = seeded.cookie.replace("mailxp.session=", "");
     const row = fake.sessions.find((s) => s.tokenHash === hashSessionToken(raw));
     expect(row?.revokedAt).toBeNull(); // untouched
   });
@@ -328,20 +228,20 @@ describe("POST /api/v1/auth/logout", () => {
 
 describe("POST /api/v1/auth/verify-email", () => {
   it("valid token → 200, marks verified, invalidates other tokens, audits", async () => {
-    const registered = await registerUser("v@x.co");
+    const seeded = await seedUser("v@x.co");
     // A second outstanding token that must be invalidated by success:
     fake.tokens.push({
       id: "manual-2",
-      userId: fake.users[0].id,
+      userId: seeded.playerId,
       purpose: "EMAIL_VERIFICATION",
       tokenHash: hashAuthToken("second-outstanding-token"),
       expiresAt: new Date(Date.now() + 3_600_000),
       consumedAt: null,
       createdAt: new Date(),
     });
-    const response = await verifyPOST(post("/auth/verify-email", { token: registered.token }));
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ player: { emailVerified: true } });
+    const result = await verifyPOST(post("/auth/verify-email", { token: seeded.token }));
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ player: { emailVerified: true } });
     expect(fake.users[0].emailVerifiedAt).toBeTruthy();
     const second = fake.tokens.find((t) => t.id === "manual-2");
     expect(second?.consumedAt).toBeTruthy(); // superseded/invalidated
@@ -349,10 +249,10 @@ describe("POST /api/v1/auth/verify-email", () => {
   });
 
   it("replay (second use) → 404, unknown → 404, garbage → 404 — identical", async () => {
-    const registered = await registerUser("r@x.co");
-    expect((await verifyPOST(post("/auth/verify-email", { token: registered.token }))).status).toBe(200);
+    const seeded = await seedUser("r@x.co");
+    expect((await verifyPOST(post("/auth/verify-email", { token: seeded.token }))).status).toBe(200);
     const replay = await verifyPOST(
-      post("/auth/verify-email", { token: registered.token }, { requestId: "fixed-rid-verify" }),
+      post("/auth/verify-email", { token: seeded.token }, { requestId: "fixed-rid-verify" }),
     );
     const unknown = await verifyPOST(
       post("/auth/verify-email", { token: "no-such-token-abc" }, { requestId: "fixed-rid-verify" }),
@@ -363,29 +263,29 @@ describe("POST /api/v1/auth/verify-email", () => {
   });
 
   it("expired token → 404", async () => {
-    const registered = await registerUser("exp@x.co");
-    const row = fake.tokens.find((t) => t.tokenHash === hashAuthToken(registered.token));
+    const seeded = await seedUser("exp@x.co");
+    const row = fake.tokens.find((t) => t.tokenHash === hashAuthToken(seeded.token));
     (row as { expiresAt: Date }).expiresAt = new Date(Date.now() - 1000);
-    const response = await verifyPOST(post("/auth/verify-email", { token: registered.token }));
-    expect(response.status).toBe(404);
+    const result = await verifyPOST(post("/auth/verify-email", { token: seeded.token }));
+    expect(result.status).toBe(404);
     expect(fake.users[0].emailVerifiedAt).toBeNull();
   });
 
   it("already verified + fresh token → 409 CONFLICT", async () => {
-    const registered = await registerUser("conflict@x.co");
-    await verifyPOST(post("/auth/verify-email", { token: registered.token }));
+    const seeded = await seedUser("conflict@x.co");
+    await verifyPOST(post("/auth/verify-email", { token: seeded.token }));
     fake.tokens.push({
       id: "manual-3",
-      userId: fake.users[0].id,
+      userId: seeded.playerId,
       purpose: "EMAIL_VERIFICATION",
       tokenHash: hashAuthToken("another-valid-token"),
       expiresAt: new Date(Date.now() + 3_600_000),
       consumedAt: null,
       createdAt: new Date(),
     });
-    const response = await verifyPOST(post("/auth/verify-email", { token: "another-valid-token" }));
-    expect(response.status).toBe(409);
-    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("CONFLICT");
+    const result = await verifyPOST(post("/auth/verify-email", { token: "another-valid-token" }));
+    expect(result.status).toBe(409);
+    expect(((await result.json()) as { error: { code: string } }).error.code).toBe("CONFLICT");
   });
 
   it("missing token → 400; cross Origin → 403", async () => {
@@ -406,30 +306,29 @@ describe("POST /api/v1/auth/verify-email", () => {
 
 describe("POST /api/v1/auth/resend-verification", () => {
   it("unknown email → 202 with empty body (no enumeration)", async () => {
-    const response = await resendPOST(post("/auth/resend-verification", { email: "ghost@x.co" }));
-    expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({});
+    const result = await resendPOST(post("/auth/resend-verification", { email: "ghost@x.co" }));
+    expect(result.status).toBe(202);
+    expect(await result.json()).toEqual({});
   });
 
   it("known unverified → 202, new token supersedes, dev surfaces token, audited", async () => {
-    const registered = await registerUser("send@x.co");
-    const response = await resendPOST(post("/auth/resend-verification", { email: "send@x.co" }));
-    expect(response.status).toBe(202);
-    const body = (await response.json()) as { devDelivery?: { token: string } };
+    const seeded = await seedUser("send@x.co");
+    const result = await resendPOST(post("/auth/resend-verification", { email: "send@x.co" }));
+    expect(result.status).toBe(202);
+    const body = (await result.json()) as { devDelivery?: { token: string } };
     expect(body.devDelivery).toBeTruthy();
-    expect(body.devDelivery?.token).not.toBe(registered.token);
+    expect(body.devDelivery?.token).not.toBe(seeded.token);
     // Prior outstanding token superseded (consumed):
-    const firstRow = fake.tokens.find((t) => t.tokenHash === hashAuthToken(registered.token));
+    const firstRow = fake.tokens.find((t) => t.tokenHash === hashAuthToken(seeded.token));
     expect(firstRow?.consumedAt).toBeTruthy();
     expect(fake.audits.map((a) => a.eventType)).toContain("auth.verification_resent");
   });
 
   it("already verified → 202 empty (nothing issued)", async () => {
-    const registered = await registerUser("done@x.co");
-    await verifyPOST(post("/auth/verify-email", { token: registered.token }));
-    const response = await resendPOST(post("/auth/resend-verification", { email: "done@x.co" }));
-    expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({});
+    const seeded = await seedUser("done@x.co", { verified: true });
+    const result = await resendPOST(post("/auth/resend-verification", { email: "done@x.co" }));
+    expect(result.status).toBe(202);
+    expect(await result.json()).toEqual({});
   });
 
   it("unauthenticated without email → 400", async () => {
@@ -437,16 +336,16 @@ describe("POST /api/v1/auth/resend-verification", () => {
   });
 
   it("a live session supplies the identity (body email ignored)", async () => {
-    const registered = await registerUser("sess@x.co");
-    const response = await resendPOST(
-      post("/auth/resend-verification", { email: "somebody-else@x.co" }, { cookie: registered.cookie }),
+    const seeded = await seedUser("sess@x.co");
+    const result = await resendPOST(
+      post("/auth/resend-verification", { email: "somebody-else@x.co" }, { cookie: seeded.cookie }),
     );
-    expect(response.status).toBe(202);
-    const body = (await response.json()) as { devDelivery?: { token: string } };
+    expect(result.status).toBe(202);
+    const body = (await result.json()) as { devDelivery?: { token: string } };
     expect(body.devDelivery).toBeTruthy();
     // Token was minted for the SESSION user:
     const last = fake.tokens[fake.tokens.length - 1];
-    expect(last.userId).toBe(registered.playerId);
+    expect(last.userId).toBe(seeded.playerId);
   });
 
   it("resend rate: 5/hour per email+IP", async () => {
@@ -459,6 +358,9 @@ describe("POST /api/v1/auth/resend-verification", () => {
 });
 
 // ---------------------------------------------------------- password flow --
+// Password reset still works mechanically (it changes the stored hash and
+// revokes sessions), but it is NOT a way in — login is retired. These tests
+// assert the reset route's own behavior without relying on login.
 
 describe("password forgot + reset", () => {
   it("forgot: unknown and known emails both 202 (no enumeration); known issues a 1h hashed token", async () => {
@@ -466,7 +368,7 @@ describe("password forgot + reset", () => {
     expect(unknown.status).toBe(202);
     expect(await unknown.json()).toEqual({});
 
-    const registered = await registerUser("resetme@x.co");
+    await seedUser("resetme@x.co");
     const before = Date.now();
     const known = await forgotPOST(post("/auth/password/forgot", { email: "resetme@x.co" }));
     expect(known.status).toBe(202);
@@ -493,52 +395,53 @@ describe("password forgot + reset", () => {
     expect((await forgotPOST(post("/auth/password/forgot", { email: "f@x.co" }, { ip }))).status).toBe(429);
   });
 
-  it("reset: single-use token changes the password and revokes ALL sessions", async () => {
-    const registered = await registerUser("changer@x.co");
+  it("reset: single-use token changes the hash and revokes ALL sessions", async () => {
+    const seeded = await seedUser("changer@x.co");
+    const before = String(fake.users[0].passwordHash);
     await forgotPOST(post("/auth/password/forgot", { email: "changer@x.co" }));
     const forgotBody = (await (await forgotPOST(post("/auth/password/forgot", { email: "changer@x.co" }))).json()) as {
       devDelivery?: { token: string };
     };
     const token = forgotBody.devDelivery?.token as string;
 
-    const response = await resetPOST(post("/auth/password/reset", { token, password: "brand-new-passphrase" }));
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({});
+    const result = await resetPOST(post("/auth/password/reset", { token, password: "brand-new-passphrase" }));
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({});
 
-    // All sessions (incl. the registration one) revoked:
+    // All sessions (incl. the seeded one) revoked:
     for (const session of fake.sessions) expect(session.revokedAt).toBeTruthy();
     expect(fake.audits.map((a) => a.eventType)).toContain("auth.password_reset");
-
-    // Old password dead, new password live:
-    expect((await loginPOST(post("/auth/login", { email: "changer@x.co", password: VALID_PW }))).status).toBe(401);
-    expect((await loginPOST(post("/auth/login", { email: "changer@x.co", password: "brand-new-passphrase" }))).status).toBe(200);
+    // The stored hash actually changed (login is retired, so verify directly):
+    expect(String(fake.users[0].passwordHash)).not.toBe(before);
 
     // Token single-use: replay → 404.
     const replay = await resetPOST(post("/auth/password/reset", { token, password: "another-passphrase" }));
     expect(replay.status).toBe(404);
+    expect(seeded.playerId).toBeTruthy();
   });
 
-  it("reset: expired token → 404 and password unchanged", async () => {
-    await registerUser("keep@x.co");
+  it("reset: expired token → 404 and hash unchanged", async () => {
+    await seedUser("keep@x.co");
+    const before = String(fake.users[0].passwordHash);
     const forgotBody = (await (await forgotPOST(post("/auth/password/forgot", { email: "keep@x.co" }))).json()) as {
       devDelivery?: { token: string };
     };
     const token = forgotBody.devDelivery?.token as string;
     const row = fake.tokens.find((t) => t.tokenHash === hashAuthToken(token));
     (row as { expiresAt: Date }).expiresAt = new Date(Date.now() - 1000);
-    const response = await resetPOST(post("/auth/password/reset", { token, password: "brand-new-passphrase" }));
-    expect(response.status).toBe(404);
-    expect((await loginPOST(post("/auth/login", { email: "keep@x.co", password: VALID_PW }))).status).toBe(200);
+    const result = await resetPOST(post("/auth/password/reset", { token, password: "brand-new-passphrase" }));
+    expect(result.status).toBe(404);
+    expect(String(fake.users[0].passwordHash)).toBe(before);
   });
 
   it("reset: weak password rejected by policy (400), token NOT consumed", async () => {
-    await registerUser("weak@x.co");
+    await seedUser("weak@x.co");
     const forgotBody = (await (await forgotPOST(post("/auth/password/forgot", { email: "weak@x.co" }))).json()) as {
       devDelivery?: { token: string };
     };
     const token = forgotBody.devDelivery?.token as string;
-    const response = await resetPOST(post("/auth/password/reset", { token, password: "password123" }));
-    expect(response.status).toBe(400);
+    const result = await resetPOST(post("/auth/password/reset", { token, password: "password123" }));
+    expect(result.status).toBe(400);
     const row = fake.tokens.find((t) => t.tokenHash === hashAuthToken(token));
     expect(row?.consumedAt).toBeNull(); // still usable after a policy rejection
     // and it still works with a good password:
@@ -546,18 +449,14 @@ describe("password forgot + reset", () => {
   });
 
   it("reset: cross Origin → 403", async () => {
-    const response = await resetPOST(
+    const result = await resetPOST(
       post("/auth/password/reset", { token: "abc", password: VALID_PW }, { origin: "https://evil.example" }),
     );
-    expect(response.status).toBe(403);
+    expect(result.status).toBe(403);
   });
 });
 
 // ------------------------------------------------- origin gate (all routes) --
-// Contract §1.2/§2 requires the Origin check on every cookie-authenticated
-// mutation (logout — covered here; DELETE /me — in me.test.ts) and explicitly
-// on register; this build applies the same gate to ALL mutations as a uniform
-// posture (documented in B4_REPORT), so every one is asserted here.
 describe("Origin gate across every auth mutation", () => {
   it("missing or cross-site Origin → 403 before any work happens", async () => {
     const mutations: Array<[string, unknown]> = [
@@ -592,26 +491,6 @@ describe("Origin gate across every auth mutation", () => {
   });
 });
 
-// ------------------------------------------------------ production posture --
-
-describe("production posture", () => {
-  it("NODE_ENV=production: no devDelivery anywhere, cookie gets Secure", async () => {
-    vi.stubEnv("NODE_ENV", "production");
-    try {
-      const response = await registerPOST(post("/auth/register", { email: "prod@x.co", password: VALID_PW }));
-      expect(response.status).toBe(201);
-      const body = (await response.json()) as Record<string, unknown>;
-      expect(Object.keys(body)).toEqual(["player"]); // exact contract shape
-      expect(setCookieOf(response)).toContain("secure");
-
-      const forgot = await forgotPOST(post("/auth/password/forgot", { email: "prod@x.co" }));
-      expect(await forgot.json()).toEqual({}); // token NOT surfaced
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
-});
-
 // ------------------------------------------------------- secrets hygiene --
 
 describe("secrets never reach logs or responses", () => {
@@ -627,20 +506,17 @@ describe("secrets never reach logs or responses", () => {
     ];
     try {
       const PASSWORD = "my-unique-secret-passphrase";
-      await registerUser("hygiene@x.co", nextIp(), PASSWORD);
-      const forgotBody = (await (await forgotPOST(post("/auth/password/forgot", { email: "hygiene@x.co" }))).json()) as {
-        devDelivery?: { token: string };
-      };
-      await loginPOST(post("/auth/login", { email: "hygiene@x.co", password: "wrong-password-x" }));
+      // A password attempt is refused; a forgot/verify still must not leak.
+      await loginPOST(post("/auth/login", { email: "hygiene@x.co", password: PASSWORD }));
+      await registerPOST(post("/auth/register", { email: "hygiene@x.co", password: PASSWORD }));
+      await forgotPOST(post("/auth/password/forgot", { email: "hygiene@x.co" }));
       await verifyPOST(post("/auth/verify-email", { token: "wrong-token-x" }));
     } finally {
       for (const spy of spies) spy.mockRestore();
     }
     const all = lines.join("\n");
     expect(all).not.toContain("my-unique-secret-passphrase");
-    expect(all).not.toContain("wrong-password-x");
     expect(all).not.toContain("wrong-token-x");
-    expect(all).not.toContain(String(fake.users[0]?.passwordHash));
-    // (register/forgot/successful login don't log at all — a regression guard)
+    expect(fake.users).toHaveLength(0); // refusal minted nothing
   });
 });

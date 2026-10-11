@@ -545,6 +545,33 @@ describe("signin branch (phase_b8a.md §3.4)", () => {
     expect(doomed.id).toBeTruthy();
   });
 
+  it("B8b: email match to an account with a DIFFERENT active connection → 'conflict', no second mailbox", async () => {
+    // The matched MailXP account already has a connected googleSub that is NOT
+    // the one signing in (phase_b8b.md §4). Sign-in must not attach a second
+    // connection, silently switch Gmail, or create a duplicate account — the
+    // whole transaction rolls back and the user gets a safe `conflict`.
+    const me = await seedUser("cb.signin.multiple@example.test");
+    await fake.client.googleConnection.create({
+      data: { userId: me.userId, googleSub: "sub-already", email: "cb.signin.multiple@example.test", scopes: "openid" },
+    });
+    const raw = await signinState();
+    // A DIFFERENT googleSub signs in but its verified email matches the account.
+    vi.stubGlobal("fetch", happyFetch({ sub: "sub-incoming", email: "cb.signin.multiple@example.test" }));
+
+    const response = await callbackGET(request(callbackUrl({ code: "c", state: raw })));
+    expect(locationOf(response)).toBe(`${ORIGIN}/?googleOAuth=conflict`);
+    expect(response.headers.get("set-cookie")).toBeNull(); // no session issued
+
+    // Still exactly ONE connection, still the original sub — nothing added.
+    expect(fake.googleConnections).toHaveLength(1);
+    expect(fake.googleConnections[0].googleSub).toBe("sub-already");
+    expect(fake.googleConnections[0].userId).toBe(me.userId);
+    expect(fake.users).toHaveLength(1); // no duplicate account
+    // The conflicting attempt is audited (accountId-free, no secrets).
+    expect(fake.audits.filter((a) => a.eventType === "google.link_conflict").length).toBeGreaterThan(0);
+    expect(JSON.stringify(fake.audits)).not.toContain("sub-incoming");
+  });
+
   it("replay of a completed signin → 'state', no second account", async () => {
     const raw = await signinState();
     vi.stubGlobal("fetch", happyFetch({ sub: "sub-replay", email: "replay@gmail.com" }));

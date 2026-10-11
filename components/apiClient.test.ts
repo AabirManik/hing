@@ -14,10 +14,8 @@ import {
   fetchGameState,
   fetchMe,
   isSessionErrorCode,
-  login,
   logoutRequest,
   patchPreferences,
-  registerAccount,
   resendVerificationEmail,
   startGoogleSignIn,
   verifyEmailToken,
@@ -60,30 +58,6 @@ afterEach(() => {
 });
 
 describe("request shapes (B4 contracts)", () => {
-  it("login posts the exact body with same-origin credentials", async () => {
-    nextResponse = () => jsonResponse(200, { player: PLAYER });
-    const player = await login("a@example.test", "correct horse battery staple");
-    expect(player).toEqual(PLAYER);
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe("/api/v1/auth/login");
-    expect(calls[0].init?.method).toBe("POST");
-    expect(calls[0].init?.credentials).toBe("same-origin"); // cookie rides along; no token in JS
-    expect(calls[0].init?.headers).toEqual({ "Content-Type": "application/json" });
-    expect(JSON.parse(calls[0].init?.body as string)).toEqual({
-      email: "a@example.test",
-      password: "correct horse battery staple",
-    });
-  });
-
-  it("register posts to the register path (201 body consumed)", async () => {
-    nextResponse = () => jsonResponse(201, { player: PLAYER });
-    const player = await registerAccount("a@example.test", "correct horse battery staple");
-    expect(player).toEqual(PLAYER);
-    expect(calls[0].url).toBe("/api/v1/auth/register");
-    expect(calls[0].init?.method).toBe("POST");
-  });
-
   it("logout posts with credentials and accepts 204", async () => {
     nextResponse = () => new Response(null, { status: 204 });
     await expect(logoutRequest()).resolves.toBeUndefined();
@@ -166,7 +140,7 @@ describe("error mapping", () => {
 
   it("malformed/non-envelope error bodies still yield a usable ApiError", async () => {
     nextResponse = () => new Response("<html>gateway</html>", { status: 502 });
-    const error = await login("a@b.c", "x").catch((caught: unknown) => caught);
+    const error = await logoutRequest().catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).code).toBe("INTERNAL_ERROR");
     expect((error as ApiError).status).toBe(502);

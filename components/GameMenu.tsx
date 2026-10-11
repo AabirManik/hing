@@ -4,6 +4,7 @@ import { useEffect, useRef, type KeyboardEvent } from "react";
 
 import { playSound } from "../game/audio/audioManager";
 import CharacterScreen from "./screens/CharacterScreen";
+import InboxScreen from "./screens/InboxScreen";
 import InventoryScreen from "./screens/InventoryScreen";
 import RewardsScreen from "./screens/RewardsScreen";
 import SettingsScreen from "./screens/SettingsScreen";
@@ -29,6 +30,7 @@ import QuestPanels from "./QuestPanels";
  */
 export const MENU_SECTIONS = [
   { id: "tasks", label: "Tasks" },
+  { id: "inbox", label: "Inbox" },
   { id: "character", label: "Character" },
   { id: "inventory", label: "Inventory" },
   { id: "shop", label: "Shop" },
@@ -93,6 +95,8 @@ export default function GameMenu({
     switch (id) {
       case "tasks":
         return <QuestPanels />;
+      case "inbox":
+        return <InboxScreen />;
       case "character":
         return <CharacterScreen onGoShop={() => activate("shop")} />;
       case "inventory":

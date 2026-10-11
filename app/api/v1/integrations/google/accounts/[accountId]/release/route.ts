@@ -52,6 +52,12 @@ export async function POST(request: Request, { params }: RouteContext): Promise<
       const row = await tx.googleConnection.findUnique({ where: { id: accountId } });
       if (!row || row.userId !== session.user.id) return null; // → 404 below
       if (row.status === "connected") {
+        // B9 retention (user decision 2026-10-11): release deletes this
+        // mailbox's synced messages + sync state (the row stays reserved for
+        // transfer, but no personal email content survives the hand-off).
+        // Explicit — the row is updated in place, so the FK cascade never fires.
+        await tx.gmailMessage.deleteMany({ where: { googleConnectionId: row.id } });
+        await tx.gmailSyncState.deleteMany({ where: { googleConnectionId: row.id } });
         const updated = await tx.googleConnection.update({
           where: { id: row.id },
           data: {

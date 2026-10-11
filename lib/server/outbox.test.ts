@@ -195,8 +195,28 @@ describe("relay transient failures — backoff then terminal after max attempts"
 });
 
 describe("planner registry & payload policy", () => {
-  it("only the deletion event type exists in B7 (no invented Gmail/Gemini work)", () => {
-    expect(Object.keys(OUTBOX_PLANNERS)).toEqual(["account.deletion_requested"]);
+  it("only the approved event types exist (deletion + the B9 gmail sync)", () => {
+    // B7's account.deletion_requested plus B9's approved gmail.sync_requested
+    // (phase_b9.md §6). Gemini must never appear.
+    expect(Object.keys(OUTBOX_PLANNERS).sort()).toEqual([
+      "account.deletion_requested",
+      "gmail.sync_requested",
+    ]);
+    expect(Object.keys(OUTBOX_PLANNERS)).not.toContain("gemini");
+  });
+
+  it("the gmail planner dispatches a coalesced job keyed only on the connection id", () => {
+    const dispatch = OUTBOX_PLANNERS["gmail.sync_requested"]!({ googleConnectionId: "conn-7" });
+    expect(dispatch.jobType).toBe("gmail.sync");
+    expect(dispatch.payload).toEqual({ googleConnectionId: "conn-7" });
+    expect(Object.keys(dispatch.payload)).toEqual(["googleConnectionId"]);
+    expect(dispatch.dedupeKey).toBe("gmail.sync:conn-7");
+  });
+
+  it("the gmail planner rejects malformed payloads as permanent validation errors", () => {
+    for (const bad of [null, undefined, "conn", 42, {}, { googleConnectionId: "" }, { googleConnectionId: 7 }]) {
+      expect(() => OUTBOX_PLANNERS["gmail.sync_requested"]!(bad)).toThrowError();
+    }
   });
 
   it("planner payloads carry only the internal userId — no email, tokens, or secrets", () => {

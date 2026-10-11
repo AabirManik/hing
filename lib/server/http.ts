@@ -42,6 +42,15 @@ export const CODES = {
   // the safe "provider config absent" answer for google.connectStart (§9).
   EMAIL_NOT_VERIFIED: "EMAIL_NOT_VERIFIED",
   SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
+  // Google-only entrance (user decision 2026-10-11): password login/register
+  // are retired — every entrance must be a real, Google-verified Gmail via
+  // "Continue with Google". Returned by the login and register routes so a
+  // direct API call can never create a dummy account or password-enter.
+  GOOGLE_SIGNIN_REQUIRED: "GOOGLE_SIGNIN_REQUIRED",
+  // B9 (contract §7.2): the mailbox's stored refresh token is revoked/invalid
+  // or the read scope was never granted — Gmail sync refuses until a human
+  // reconnects. Distinct from a transient provider error (which retries).
+  RECONNECT_REQUIRED: "RECONNECT_REQUIRED",
 } as const;
 
 export interface FieldError {

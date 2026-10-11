@@ -14,6 +14,10 @@
 import type {
   DevRewardResultDto,
   GameStateDto,
+  GmailMessageDetailDto,
+  GmailMessageListDto,
+  GmailSyncStartDto,
+  GmailSyncStatusDto,
   GoogleStartDto,
   GoogleStatusDto,
   MePlayer,
@@ -135,22 +139,6 @@ export async function fetchMe(): Promise<MePlayer | null> {
   }
 }
 
-export async function login(email: string, password: string): Promise<MePlayer> {
-  const body = await request<{ player: MePlayer }>("/api/v1/auth/login", {
-    method: "POST",
-    body: { email, password },
-  });
-  return body.player;
-}
-
-export async function registerAccount(email: string, password: string): Promise<MePlayer> {
-  const body = await request<{ player: MePlayer }>("/api/v1/auth/register", {
-    method: "POST",
-    body: { email, password },
-  });
-  return body.player;
-}
-
 /** Logout: a dead cookie (401) still means "signed out" — never throws 401. */
 export async function logoutRequest(): Promise<void> {
   try {
@@ -249,6 +237,31 @@ export async function disconnectGoogleAccount(accountId: string): Promise<void> 
   await request<unknown>(`/api/v1/integrations/google/accounts/${encodeURIComponent(accountId)}`, {
     method: "DELETE",
   });
+}
+
+// ------------------------------------------------- Gmail inbox (Phase B9) ---
+// All reads hit the LOCAL mirror; "sync" enqueues a durable job (never inline
+// provider work). No mutation calls exist here — send/draft/label are B11.
+
+/** GET /api/v1/gmail/sync-status — persistent sync state for one mailbox. */
+export async function fetchGmailSyncStatus(): Promise<GmailSyncStatusDto> {
+  return request<GmailSyncStatusDto>("/api/v1/gmail/sync-status");
+}
+
+/** POST /api/v1/gmail/sync — enqueue a coalesced sync job (202). */
+export async function startGmailSync(): Promise<GmailSyncStartDto> {
+  return request<GmailSyncStartDto>("/api/v1/gmail/sync", { method: "POST", body: {} });
+}
+
+/** GET /api/v1/gmail/messages — cursor-paginated, newest-first inbox page. */
+export async function fetchGmailMessages(cursor?: string): Promise<GmailMessageListDto> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return request<GmailMessageListDto>(`/api/v1/gmail/messages${query}`);
+}
+
+/** GET /api/v1/gmail/messages/{id} — safe plain-text message detail. */
+export async function fetchGmailMessage(messageId: string): Promise<GmailMessageDetailDto> {
+  return request<GmailMessageDetailDto>(`/api/v1/gmail/messages/${encodeURIComponent(messageId)}`);
 }
 
 // ------------------------------------------ email verification (B8a UI) ---
